@@ -1,0 +1,103 @@
+# =============================================================================
+#  {{ cookiecutter.project_name }} - Workflow
+# =============================================================================
+#
+#  Usage:
+#    manager = WorkflowManager("{{ cookiecutter.environment }}")
+#    manager.load_workflow("configuration/workflow.yml")
+#    results = manager.run_workflow(entity_list=entities)
+#
+#  Kept deliberately ASCII-only. load_workflow() reads this file as utf-8-sig,
+#  so non-ASCII is safe now, but a plain `open()` elsewhere in your own tooling
+#  would fall back to the locale default (cp1252 on Windows) and fail to decode
+#  before the YAML is ever parsed.
+#
+# =============================================================================
+
+workflow:
+  name: "{{ cookiecutter.project_name }}"
+  description: "{{ cookiecutter.project_description }}"
+
+  settings:
+    max_workers: {{ cookiecutter.max_workers }}
+    partial_frequency: {{ cookiecutter.partial_frequency }}
+
+    # Canonical entity field -> what YOUR frame calls it.
+    #
+    # Extractors read `id`, `geometry`, `crop`, `start_date`, `end_date` and
+    # `sowing_date`. If your entity frame uses other names, map them here once
+    # and every step inherits it. Entities loaded from the platform normally
+    # need at least the two below.
+    #
+    # A step can add to or override individual keys under its own
+    # `setup.params.column_mapping` - the two MERGE, so a step-level entry does
+    # not lose what is set here. Reach for that before writing a transform:
+    # renaming is what column_mapping is for.
+    #
+    # column_mapping:
+    #   crop: "crop.id"
+    #   sowing_date: sowingDate
+
+  steps:
+
+    # -- Step 1: Example extractor step -------------------------------------
+    # Replace with your first extraction step.
+    - name: coverage
+      extractor: CoverageExtractor
+      module: earthdaily.agriculture.extractors.coverage_function
+      setup:
+        method: setup_coverage_parameters
+        params:
+          vegetation_index: NDVI
+          start_date: "2025-01-01"
+          end_date: "2025-12-31"
+          clear_cover_min: 90
+      run:
+        method: process_entity_coverage_bulk_parallel
+        params:
+          prefix: coverage
+          skip_export: true
+
+    # -- Step 2: Example chained step ---------------------------------------
+    # `depends_on` gives the order AND, by default, hands this step the
+    # upstream's results_df as its entity_list. That frame carries the original
+    # entity columns through alongside the upstream's outputs, so a correct
+    # chain usually needs no glue at all: no transform, no `input_from`, and
+    # often no extra mapping.
+    #
+    # Set `input_from: original` to receive the entity_list passed to
+    # run_workflow() instead, or `input_from: <step_name>` to pull from a
+    # non-immediate upstream.
+    #
+    # - name: zoning
+    #   depends_on: coverage
+    #   extractor: ZoningExtractor
+    #   module: earthdaily.agriculture.extractors.zoning_functions
+    #   setup:
+    #     method: setup_zoning_parameters
+    #     params:
+    #       num_zones: 5
+    #       # Per-step mapping, merged over settings.column_mapping above.
+    #       # column_mapping:
+    #       #   id: entity_id
+    #   run:
+    #     method: process_entity_zoning_bulk_parallel
+    #     params:
+    #       prefix: zoning
+
+    # -- Step 3: Transform step, when the grain actually changes -------------
+    # A transform is for reshaping: long to wide, aggregating, filtering to a
+    # subset, or joining an external file. It is NOT the way to rename columns
+    # (use column_mapping) or to pass the upstream frame along (use
+    # depends_on). Every transform is a step that runs, logs and can fail, so
+    # add one only when the shape of the data really changes.
+    #
+    # See the `create_workflow` runbook for the full decision table.
+    #
+    # - name: my_transform
+    #   depends_on: coverage
+    #   transform:
+    #     module: app.transforms
+    #     function: my_transform
+    #     params:
+    #       depends_on: coverage

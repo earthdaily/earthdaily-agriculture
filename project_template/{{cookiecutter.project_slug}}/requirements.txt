@@ -1,0 +1,52 @@
+# ============================================================================
+# {{ cookiecutter.project_name }} — Requirements
+# ============================================================================
+# Python version: 3.10–3.13 (recommended {{ cookiecutter.python_version }}.x; 3.13 supported
+#   and tested in CI). 3.14 is untested — the wheel may install but nothing verifies it.
+# Install with: pip install -r requirements.txt
+# ============================================================================
+
+# EarthDaily Agriculture Utils (local package — rebuild after source changes: python -m build)
+# The wheel declares its own dependencies, so installing it pulls requests, pyarrow
+# (Parquet export), duckdb, rasterio, folium, scipy, reportlab, boto3 and the rest.
+# What follows is this project's own direct surface — not a full lock file.
+dist/earthdaily_agriculture-{{ cookiecutter.edagro_wheel_version }}-py3-none-any.whl
+
+# Data Processing & Analysis
+pandas>=2.2
+# Upper bound mirrors the wheel's own `numpy>=2.2.5,<2.5` so this file can't
+# advertise a version the package refuses to resolve against.
+numpy>=2.2.5,<2.5
+geopandas>=1.0
+shapely>=2.0
+pygeohash>=3.0  # centroid geohash buckets for spatial grouping (Weather/GDD)
+
+# Visualization
+matplotlib>=3.10
+plotly>=6.0
+
+# Logging
+loguru>=0.7
+
+# Configuration & Environment
+python-dotenv>=1.0
+pyyaml>=6.0
+
+# Jupyter Notebook Support
+jupyter>=1.0
+ipykernel>=6.28
+ipywidgets>=8.0
+
+# Data Export
+openpyxl>=3.1
+
+# ---------------------------------------------------------------------------
+# Optional — cloud storage (S3-compatible writes for results / partials / cache)
+# ---------------------------------------------------------------------------
+# Uncomment to enable s3://, gs://, az://, etc. paths in WorkflowManager(...)
+# kwargs. See docs/13 - Cloud_storage_principles_and_usage.md for the full
+# guide. Default-to-local: leave commented if you only write to disk.
+#
+# s3fs>=2024.0      # s3://   (matches the package's [s3] extra)
+# adlfs>=2024.0     # az://   (matches the package's [azure] extra)
+# fsspec>=2024.0    # required by either backend

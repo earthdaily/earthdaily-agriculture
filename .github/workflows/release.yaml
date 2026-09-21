@@ -1,0 +1,77 @@
+name: Release (TestPyPI)
+
+# ──────────────────────────────────────────────────────────────────────────
+# STAGING PUBLISH — rehearses the real release against test.pypi.org.
+#
+# Fires when a `v*` tag lands on this repo. The internal repo's release
+# pipeline force-pushes the stripped payload to this mirror and pushes the
+# tag, so an internal `v2.5.7` tag drives this workflow end to end.
+#
+# There is no path to production PyPI here: the only configured target is
+# test.pypi.org. Add the pypi.org publish as a separate step/workflow once the
+# staging rehearsal has proven the pipeline.
+#
+# Auth is OIDC trusted publishing — no API token is stored anywhere. The
+# publisher registered on test.pypi.org is:
+#     Owner: earthdaily | Repository: earthdaily-agriculture
+#     Workflow: release.yaml | Environment: pypi
+# All four must match exactly. **The filename is part of that registration** —
+# renaming this file (or changing the environment) breaks the OIDC exchange
+# with a 403 until the publisher is re-registered on test.pypi.org.
+#
+# Note: the upstream earthdaily-python-client workflow guards its publish with
+# `if: ${{ !github.event.repository.private }}`. That guard is deliberately
+# NOT copied here — this mirror is still a private repo, so it would skip the
+# job on every run. Reinstate it if/when the mirror goes public.
+# ──────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      # Named `pypi` because that is what the TestPyPI trusted publisher is registered
+      # with — the claim must match EXACTLY, and a first dry run failed on
+      # `invalid-publisher` when this said `testpypi`. The name is therefore about the
+      # publisher registration, NOT about which index is targeted: the upload URL below
+      # is the only thing that decides that, and it is test.pypi.org. Worth revisiting
+      # when a production publisher is added, so the two do not share an approval gate.
+      name: pypi
+      url: https://test.pypi.org/p/earthdaily-agriculture
+    permissions:
+      id-token: write # OIDC for trusted publishing — no API token
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: GATE 2 — install + test the synced tree
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+          pytest -q -p no:cacheprovider
+
+      - name: Build wheel + sdist
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to TestPyPI (OIDC trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # TestPyPI rejects a version that already exists. Re-running the same
+          # tag would otherwise fail on the upload rather than on anything real,
+          # so duplicates are skipped — but note that makes a re-run go green
+          # WITHOUT publishing. Check the step log for "Skipping" before reading
+          # a green run as proof the upload works; bump the version to republish.
+          skip-existing: true

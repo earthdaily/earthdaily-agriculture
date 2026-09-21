@@ -1,0 +1,48 @@
+name: "CodeQL Advanced"
+
+# Ships to the public earthdaily/earthdaily-agriculture mirror via the strip
+# script (release/build_public_subset.py). CodeQL Advanced is free on public
+# repos but requires a GHAS license on private ones; the `if:` guard below
+# makes the job a no-op if this workflow ever runs on a private fork.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '31 17 * * 5'
+
+jobs:
+  analyze:
+    if: ${{ !github.event.repository.private }}  # Only run on public repos
+
+    name: Analyze (${{ matrix.language }})
+    runs-on: 'ubuntu-latest'
+    permissions:
+      security-events: write
+      packages: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - language: actions
+          build-mode: none
+        - language: python
+          build-mode: none
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{matrix.language}}"

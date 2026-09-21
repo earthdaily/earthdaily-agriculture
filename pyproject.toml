@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "earthdaily-agriculture"
+version = "2.6.0-rc2"
+description = "Utilities for bulk analytics extraction from the EarthDaily Agriculture APIs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "EarthDaily Analytics" }]
+maintainers = [{ name = "EarthDaily Analytics" }]
+keywords = [
+    "earthdaily", "agriculture", "agronomy", "remote sensing", "satellite",
+    "vegetation index", "ndvi", "gis", "crop monitoring",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+    "requests>=2.31.0",
+    "urllib3>=1.26.0",
+    "pandas>=2.2.3",
+    "numpy>=2.2.5,<2.5",
+    "pyarrow",
+    "duckdb>=1.4.2",
+    "geopandas>=1.0.1",
+    "shapely>=2.1.0",
+    "rasterio",
+    "contextily",
+    "pygeohash>=3.0",
+    "matplotlib>=3.10.1",
+    "folium",
+    "plotly>=6.5.0",
+    "tqdm>=4.64.0",
+    "loguru>=0.6.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    "python-dateutil>=2.8.0",
+    "Pillow>=9.3.0",
+    "scipy",
+    "reportlab",
+    "boto3>=1.42.2,<1.43",
+    "earthdaily",
+    "tabulate>=0.9.0",
+    "openpyxl>=3.1.5",
+]
+
+[project.optional-dependencies]
+jupyter = ["jupyter", "ipykernel", "notebook", "ipython", "ipywidgets>=8.0", "anywidget>=0.9"]
+test = ["pytest>=7.0", "pytest-mock>=3.10"]
+s3 = ["s3fs>=2024.0", "fsspec>=2024.0"]
+azure = ["adlfs>=2024.0", "fsspec>=2024.0"]
+cloud = ["s3fs>=2024.0", "adlfs>=2024.0", "fsspec>=2024.0"]
+cube = ["xarray>=2024.0", "zarr>=2.17", "rioxarray>=0.15"]
+report = ["selenium>=4.6"]
+
+[project.urls]
+Homepage = "https://github.com/earthdaily/earthdaily-agriculture"
+Repository = "https://github.com/earthdaily/earthdaily-agriculture"
+Documentation = "https://docs.earthdaily.com/agro/"
+Issues = "https://github.com/earthdaily/earthdaily-agriculture/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["earthdaily.agriculture", "earthdaily.agriculture.*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"earthdaily.agriculture.ai_enablement" = ["personal_skill_templates/**/*.md"]
+# The corporate mark the HTML reports embed. It is read through
+# importlib.resources, so it has to be package-data — being in the allowlist only
+# gets it into the sdist. Without this the wheel imports fine and every report
+# silently drops its branding, since _logo_data_uri() degrades to a text link.
+"earthdaily.agriculture.reporting" = ["assets/*.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short -m 'not integration'"
+markers = [
+    "integration: tests that hit real APIs — require credentials, skipped by default",
+    "public: tests that exercise the public package surface",
+]
