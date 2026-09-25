@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "earthdaily-agriculture"
-version = "2.6.0-rc4"
+version = "2.6.0"
 description = "Utilities for bulk analytics extraction from the EarthDaily Agriculture APIs"
 readme = "README.md"
 requires-python = ">=3.10"
