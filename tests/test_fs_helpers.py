@@ -18,6 +18,7 @@ from earthdaily.agriculture.core._fs import (
     glob_files,
     is_remote_path,
     join_path,
+    nonempty_file_exists,
     remove_files,
     storage_options_for,
     write_bytes,
@@ -392,6 +393,25 @@ class TestWriteBytes:
         write_bytes(target, payload)
         assert target.read_bytes() == payload
 
+    def test_local_write_is_atomic_no_part_left(self, tmp_path):
+        """Written via a '.part' temp file then renamed — nothing left behind on success."""
+        target = tmp_path / "field.tif"
+        write_bytes(target, b"raster")
+        assert target.read_bytes() == b"raster"
+        assert not (tmp_path / "field.tif.part").exists()
+
+    def test_failed_local_write_leaves_no_final_file(self, tmp_path, monkeypatch):
+        """A crash mid-write must not leave a truncated file under the final name."""
+        target = tmp_path / "field.tif"
+
+        def _boom(*a, **k):
+            raise OSError("disk died")
+
+        monkeypatch.setattr("earthdaily.agriculture.core._fs.os.replace", _boom)
+        with pytest.raises(OSError):
+            write_bytes(target, b"raster")
+        assert not target.exists()
+
     def test_remote_path_routes_through_fsspec(self, monkeypatch):
         """A remote URI goes to fsspec in binary mode, never to local disk."""
         captured = {}
@@ -627,3 +647,24 @@ class TestFinalizeExtractionRemotePathPlumbing:
         for c in captured_to_csv:
             if c["path"].startswith("s3://"):
                 assert c.get("storage_options") == {}
+
+
+# ---------------------------------------------------------------------------
+# nonempty_file_exists — the FLM skip_existing check
+# ---------------------------------------------------------------------------
+
+
+class TestNonemptyFileExists:
+    def test_true_for_nonempty_file(self, tmp_path):
+        f = tmp_path / "a.tif"
+        f.write_bytes(b"x")
+        assert nonempty_file_exists(f) is True
+
+    def test_false_for_empty_file(self, tmp_path):
+        f = tmp_path / "a.tif"
+        f.write_bytes(b"")
+        assert nonempty_file_exists(f) is False
+
+    def test_false_for_missing_file_or_directory(self, tmp_path):
+        assert nonempty_file_exists(tmp_path / "missing.tif") is False
+        assert nonempty_file_exists(tmp_path) is False

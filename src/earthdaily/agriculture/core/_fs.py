@@ -177,7 +177,26 @@ def write_bytes(path: str | os.PathLike[str], data: bytes) -> None:
 
     p = Path(s)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(data)
+    # Write to a sibling temp file, then rename: a crash mid-write leaves a stray
+    # '.part', never a truncated file under the final name (which skip_existing
+    # would otherwise take for a finished download).
+    tmp = p.with_name(p.name + ".part")
+    tmp.write_bytes(data)
+    os.replace(tmp, p)
+
+
+def nonempty_file_exists(path: str | os.PathLike[str]) -> bool:
+    """True if *path* exists and is a non-empty file (local or remote)."""
+    s = str(path)
+    try:
+        if is_remote_path(s):
+            import fsspec  # lazy
+
+            fs, _ = fsspec.core.url_to_fs(s, **(storage_options_for(s) or {}))
+            return bool(fs.exists(s)) and (fs.size(s) or 0) > 0
+        return os.path.isfile(s) and os.path.getsize(s) > 0
+    except Exception:
+        return False
 
 
 def glob_files(pattern: str | os.PathLike[str]) -> list[str]:

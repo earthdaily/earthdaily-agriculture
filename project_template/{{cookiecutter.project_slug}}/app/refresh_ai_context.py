@@ -137,8 +137,9 @@ def main() -> int:
         # Non-blocking; print actionable hint.
         print(
             f"[earthdaily-agriculture] WARN: AI-context refresh exited {exc.returncode}. If you "
-            "just bumped the wheel, run `pip install --force-reinstall "
-            f"dist/earthdaily_agriculture-{WHEEL_VERSION}-py3-none-any.whl` and try again.",
+            "just bumped the version, reinstall the package and try again: "
+            f"`pip install --force-reinstall earthdaily-agriculture=={WHEEL_VERSION}` "
+            "(or the matching wheel under dist/ if you build from source).",
             file=sys.stderr,
         )
         return 0  # non-blocking

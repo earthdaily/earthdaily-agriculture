@@ -162,6 +162,35 @@ class TestSetupCoverageParameters:
         coverage_extractor.setup_coverage_parameters(mask="All", filter="none")
         assert coverage_extractor.coverage_params["mask"] == "All"
 
+    # --- sensors ---
+
+    def test_sensors_default_not_stored(self, coverage_extractor):
+        """No sensor filter -> no 'sensors' key, so existing cache hashes stay valid."""
+        coverage_extractor.setup_coverage_parameters()
+        assert "sensors" not in coverage_extractor.coverage_params
+
+    def test_sensors_string_normalized_to_list(self, coverage_extractor):
+        coverage_extractor.setup_coverage_parameters(sensors="sentinel_2")
+        assert coverage_extractor.coverage_params["sensors"] == ["SENTINEL_2"]
+
+    def test_sensors_list_normalized_and_deduplicated(self, coverage_extractor):
+        coverage_extractor.setup_coverage_parameters(sensors=["LANDSAT_9", "sentinel_2", "SENTINEL_2"])
+        assert coverage_extractor.coverage_params["sensors"] == ["LANDSAT_9", "SENTINEL_2"]
+
+    @pytest.mark.parametrize("bad", [[], [""], [None], 42, "SENTINEL2", ["SENTINEL_2", "BOGUS"]])
+    def test_invalid_sensors_raises(self, coverage_extractor, bad):
+        with pytest.raises(ValueError, match="sensors"):
+            coverage_extractor.setup_coverage_parameters(sensors=bad)
+
+    def test_single_sensor_rejects_duplicate_filter(self, coverage_extractor):
+        """The duplicate filter pairs different sensors — one sensor would always return nothing."""
+        with pytest.raises(ValueError, match="duplicate"):
+            coverage_extractor.setup_coverage_parameters(sensors="SENTINEL_2", filter="duplicate")
+
+    def test_two_sensors_allowed_with_duplicate_filter(self, coverage_extractor):
+        coverage_extractor.setup_coverage_parameters(sensors=["SENTINEL_2", "LANDSAT_9"], filter="duplicate")
+        assert coverage_extractor.coverage_params["sensors"] == ["LANDSAT_9", "SENTINEL_2"]
+
     # --- column_mapping ---
 
     def test_column_mapping_applied(self, coverage_extractor):

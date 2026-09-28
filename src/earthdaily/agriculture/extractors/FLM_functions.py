@@ -52,7 +52,7 @@ class FLMExtractor(BaseExtractor):
 
     Args (setup_flm_parameters):
         vegetation_index (str): Index type ('NDVI', 'EVI', 'NDRE', etc.). Default: 'NDVI'
-        map_format (str): Output format (None, 'png', 'tiff'). Default: None
+        map_format (str): Output format (None, 'png', 'tiff', 'tiff.zip', 'shp.zip'). Default: None
         output_epsg (int): Output coordinate system. Default: 4326
         postprocess (str): Post-processing mode ('stats', 'links', 'file', 'histogram'). Default: 'stats'
             'histogram' sets histogram=true on the query and returns the per-bucket
@@ -119,10 +119,12 @@ class FLMExtractor(BaseExtractor):
 
         Args:
             vegetation_index (str): Vegetation index to extract
-            map_format (str): Format of the map ('png', 'tiff.zip', 'shp.zip')
+            map_format (str): Format of the map ('png', 'tiff', 'tiff.zip', 'shp.zip')
             output_epsg (int): Output EPSG code for projection
             postprocess (str): Post-processing type - 'stats', 'file', 'links', or 'histogram'. Default: 'stats'
-            skip_existing (bool): Skip download if file already exists
+            skip_existing (bool): With postprocess='file', skip the API call when the output
+                file for an entity/image is already in output_path (non-empty). Lets a crashed
+                bulk run resume without re-downloading. Default: True
             output_path (str): Path to save downloaded maps
             extract_stats (bool): If True, extract statistics only (no file download)
             partial_frequency (int): How often to save partial results
@@ -161,7 +163,7 @@ class FLMExtractor(BaseExtractor):
             raise ValueError(error_msg)
 
         # Map format validation
-        valid_formats = {"png", "tiff.zip", "shp.zip", None}
+        valid_formats = {"png", "tiff", "tiff.zip", "shp.zip", None}
         if map_format not in valid_formats:
             error_msg = f"Invalid map_format '{map_format}'. Must be one of {valid_formats}"
             log.error(error_msg)
@@ -236,7 +238,7 @@ class FLMExtractor(BaseExtractor):
         # ✅ Cross-validation: postprocess='file' requirements
         if postprocess == "file":
             if map_format is None:
-                error_msg = "postprocess='file' requires map_format to be set ('png', 'tiff.zip', or 'shp.zip')"
+                error_msg = "postprocess='file' requires map_format to be set ('png', 'tiff', 'tiff.zip', or 'shp.zip')"
                 log.error(error_msg)
                 raise ValueError(error_msg)
 
@@ -553,10 +555,38 @@ class FLMExtractor(BaseExtractor):
         log.debug(f"Created histogram DataFrame ({df.shape[1]} columns) for entity {entity_id}")
         return df
 
+    # Extension of the main file written per map_format (shp.zip: the .shp component)
+    _MAP_FORMAT_EXTENSION = {"png": ".png", "tiff": ".tif", "tiff.zip": ".tif", "shp.zip": ".shp"}
+
+    def _flm_output_basename(self, entity_data, image_id):
+        """Sanitized base filename (no extension) for an entity/image map file."""
+        entity_id = self.get_entity_value(entity_data, "id")
+        entity_name = entity_data.get("name")  # 'name' is not a mapped field
+        if entity_name:
+            output_filename = f"{entity_name}_{entity_id}_{image_id}_{self.flm_params['vegetation_index']}"
+        else:
+            output_filename = f"{entity_id}_{image_id}_{self.flm_params['vegetation_index']}"
+
+        # Sanitize filename - remove invalid characters for Windows
+        for char in '<>:"|?*':
+            output_filename = output_filename.replace(char, "_")
+        return output_filename.replace("/", "_").replace("\\", "_")
+
+    def _existing_flm_file(self, entity_data, image_id, output_path=None):
+        """Path of the already-saved map file for this entity/image, or None."""
+        from earthdaily.agriculture.core import _fs
+
+        save_path = output_path or self.flm_params.get("output_path", self.output_path)
+        extension = self._MAP_FORMAT_EXTENSION.get(self.flm_params.get("map_format"))
+        if not save_path or not extension:
+            return None
+        path = _fs.join_path(save_path, self._flm_output_basename(entity_data, image_id) + extension)
+        return path if _fs.nonempty_file_exists(path) else None
+
     @require_flm_params
     def format_flm_map_file(self, entity_data: dict, image_id: str, response, output_path=None):
         """
-        Save FLM map file response (PNG, TIFF.ZIP, or SHP.ZIP) to disk.
+        Save FLM map file response (PNG, TIFF, TIFF.ZIP, or SHP.ZIP) to disk.
         Handles extraction of zipped files and proper naming.
 
         Args:
@@ -570,7 +600,6 @@ class FLMExtractor(BaseExtractor):
         """
         params = self.flm_params
         entity_id = self.get_entity_value(entity_data, "id")
-        entity_name = entity_data.get("name")  # 'name' is not a mapped field
         log = self.get_contextualized_logger("FILE_SAVE")
 
         log.info(f"Saving FLM map file for entity {entity_id}, image {image_id}")
@@ -590,18 +619,7 @@ class FLMExtractor(BaseExtractor):
             map_format = params.get("map_format", "png")
             log.debug(f"Map format: {map_format}")
 
-            # Construct base filename
-            if entity_name:
-                output_filename = f"{entity_name}_{entity_id}_{image_id}_{params['vegetation_index']}"
-            else:
-                output_filename = f"{entity_id}_{image_id}_{params['vegetation_index']}"
-
-            # Sanitize filename - remove invalid characters for Windows
-            invalid_chars = '<>:"|?*'
-            for char in invalid_chars:
-                output_filename = output_filename.replace(char, "_")
-            output_filename = output_filename.replace("/", "_").replace("\\", "_")
-
+            output_filename = self._flm_output_basename(entity_data, image_id)
             log.debug(f"Sanitized filename: {output_filename}")
 
             saved_files = []
@@ -612,6 +630,12 @@ class FLMExtractor(BaseExtractor):
                 full_path = self.save_map_file(save_path, f"{output_filename}.png", response.content)
                 saved_files.append(full_path)
                 log.debug(f"Saved PNG: {full_path}")
+
+            elif map_format == "tiff":
+                log.debug("Processing TIFF format")
+                full_path = self.save_map_file(save_path, f"{output_filename}.tif", response.content)
+                saved_files.append(full_path)
+                log.debug(f"Saved TIFF: {full_path}")
 
             elif map_format == "tiff.zip":
                 log.debug("Processing TIFF.ZIP format")
@@ -792,6 +816,24 @@ class FLMExtractor(BaseExtractor):
             }
 
         log.debug(f"Image ID validated for entity {entity_id}: {image_id}")
+
+        # Step 2b: resume support — the file is already on disk, skip the API call
+        if params.get("postprocess") == "file" and params.get("skip_existing"):
+            existing = self._existing_flm_file(row, image_id, output_path=params.get("output_path"))
+            if existing:
+                log.debug(f"Skipping entity {entity_id}, image {image_id}: already saved at {existing}")
+                flm_df = pd.DataFrame(
+                    [
+                        {
+                            "status": "skipped_existing",
+                            "map_format": params.get("map_format"),
+                            "file_count": 1,
+                            "total_size_bytes": None,
+                            "saved_files": str([existing]),
+                        }
+                    ]
+                )
+                return {"data": normalize_with_metadata(row, flm_df), "error": None}
 
         # Step 3: define API call wrapper
         def _call_api():

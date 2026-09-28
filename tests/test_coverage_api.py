@@ -92,6 +92,30 @@ class TestGetSatelliteCoverageByGeometry:
         assert "$limit=10000" in actual_url
         assert "image.date=$gte:2025-01-01" in actual_url
         assert "mask=auto" in actual_url
+        assert "image.sensor=" not in actual_url  # no sensors -> no server-side filter
+
+    @pytest.mark.parametrize(
+        "sensors, expected",
+        [
+            (["SENTINEL_2"], "image.sensor=$in:SENTINEL_2"),
+            (["LANDSAT_9", "SENTINEL_2"], "image.sensor=$in:LANDSAT_9|SENTINEL_2"),
+        ],
+    )
+    @patch("earthdaily.agriculture.extractors.coverage_function.validate_wkt", side_effect=lambda x: x)
+    @patch("earthdaily.agriculture.extractors.coverage_function.requests.post")
+    def test_sensors_sent_as_image_sensor_query_param(
+        self, mock_post, mock_wkt, sensors, expected, configured_coverage_extractor, sample_coverage_entity
+    ):
+        """sensors -> image.sensor=$in:<a>|<b> (checked live against MPV5)."""
+        configured_coverage_extractor.coverage_params["sensors"] = sensors
+        mock_response = MagicMock()
+        mock_response.json.return_value = []
+        mock_response.raise_for_status.return_value = None
+        mock_post.return_value = mock_response
+
+        configured_coverage_extractor.get_satellite_coverage_by_geometry(sample_coverage_entity)
+
+        assert expected in mock_post.call_args.args[0]
 
     @patch("earthdaily.agriculture.extractors.coverage_function.validate_wkt", side_effect=lambda x: x)
     @patch("earthdaily.agriculture.extractors.coverage_function.requests.post")

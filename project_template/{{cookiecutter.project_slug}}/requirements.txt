@@ -6,11 +6,17 @@
 # Install with: pip install -r requirements.txt
 # ============================================================================
 
-# EarthDaily Agriculture Utils (local package — rebuild after source changes: python -m build)
+# EarthDaily Agriculture Utils.
 # The wheel declares its own dependencies, so installing it pulls requests, pyarrow
 # (Parquet export), duckdb, rasterio, folium, scipy, reportlab, boto3 and the rest.
 # What follows is this project's own direct surface — not a full lock file.
+{% if cookiecutter.edagro_source_path %}
+# Local wheel: you scaffolded with `edagro_source_path`, so this project builds
+# against your checkout. Rebuild after source changes: `python -m build`.
 dist/earthdaily_agriculture-{{ cookiecutter.edagro_wheel_version }}-py3-none-any.whl
+{% else %}
+earthdaily-agriculture=={{ cookiecutter.edagro_wheel_version }}
+{% endif %}
 
 # Data Processing & Analysis
 pandas>=2.2

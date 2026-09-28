@@ -213,6 +213,47 @@ class TestFormatCoverageJsonDuplicateFilter:
 
 
 # ===================================================================
+# format_coverage_json() — sensors filter
+# ===================================================================
+
+
+class TestFormatCoverageJsonSensorFilter:
+    """coverage_params['sensors'] keeps only the listed sensors."""
+
+    def test_no_sensor_filter_keeps_all_sensors(self, configured_coverage_extractor, sample_coverage_response_list):
+        df = configured_coverage_extractor.format_coverage_json(sample_coverage_response_list)
+        assert set(df["sensor"]) == {"SENTINEL_2", "LANDSAT_9"}
+
+    def test_single_sensor_filter(self, configured_coverage_extractor, sample_coverage_response_list):
+        configured_coverage_extractor.coverage_params["sensors"] = ["SENTINEL_2"]
+        df = configured_coverage_extractor.format_coverage_json(sample_coverage_response_list)
+
+        assert len(df) == 2
+        assert set(df["sensor"]) == {"SENTINEL_2"}
+
+    def test_sensor_filter_applied_before_duplicate_filter(
+        self, configured_coverage_extractor, sample_coverage_response_list, monkeypatch
+    ):
+        configured_coverage_extractor.coverage_params["sensors"] = ["LANDSAT_9"]
+        configured_coverage_extractor.coverage_params["filter"] = "duplicate"
+        seen = {}
+
+        def fake_filter(df_in):
+            seen["sensors"] = set(df_in["sensor"])
+            return df_in
+
+        monkeypatch.setattr(configured_coverage_extractor, "_filter_duplicates", fake_filter)
+        configured_coverage_extractor.format_coverage_json(sample_coverage_response_list)
+
+        assert seen["sensors"] == {"LANDSAT_9"}
+
+    def test_unmatched_sensor_returns_empty(self, configured_coverage_extractor, sample_coverage_response_list):
+        configured_coverage_extractor.coverage_params["sensors"] = ["SENTINEL_1"]
+        df = configured_coverage_extractor.format_coverage_json(sample_coverage_response_list)
+        assert df.empty
+
+
+# ===================================================================
 # format_coverage_json() — empty / edge cases
 # ===================================================================
 

@@ -191,6 +191,78 @@ class TestProcessSingleEntityFlmFile:
         assert result["data"] is None
         assert "Unsupported map_format" in result["error"]["message"]
 
+    # --- skip_existing (resume a crashed run without re-downloading) ---
+
+    @pytest.mark.parametrize("map_format, ext", [("tiff", ".tif"), ("tiff.zip", ".tif"), ("png", ".png")])
+    @patch("earthdaily.agriculture.extractors.FLM_functions.normalize_with_metadata", side_effect=lambda r, df: df)
+    @patch("earthdaily.agriculture.extractors.FLM_functions.validate_wkt", side_effect=lambda x: x)
+    @patch("earthdaily.agriculture.extractors.FLM_functions.retry_with_backoff_no_retry_on_400")
+    def test_skip_existing_skips_api_call_when_file_on_disk(
+        self,
+        mock_retry,
+        mock_wkt,
+        mock_normalize,
+        map_format,
+        ext,
+        configured_flm_extractor,
+        sample_flm_entity,
+        tmp_path,
+    ):
+        configured_flm_extractor.flm_params.update(
+            {"postprocess": "file", "map_format": map_format, "output_path": str(tmp_path), "skip_existing": True}
+        )
+        name = configured_flm_extractor._flm_output_basename(sample_flm_entity, FLM_IMAGE_ID) + ext
+        (tmp_path / name).write_bytes(b"ALREADY_THERE")
+
+        with patch.object(configured_flm_extractor, "ensure_token_valid"):
+            result = configured_flm_extractor.process_single_entity_flm(sample_flm_entity)
+
+        mock_retry.assert_not_called()
+        assert result["error"] is None
+        assert result["data"].iloc[0]["status"] == "skipped_existing"
+        assert name in result["data"].iloc[0]["saved_files"]
+
+    @patch("earthdaily.agriculture.extractors.FLM_functions.normalize_with_metadata", side_effect=lambda r, df: df)
+    @patch("earthdaily.agriculture.extractors.FLM_functions.validate_wkt", side_effect=lambda x: x)
+    @patch("earthdaily.agriculture.extractors.FLM_functions.retry_with_backoff_no_retry_on_400")
+    def test_skip_existing_redownloads_empty_file(
+        self, mock_retry, mock_wkt, mock_normalize, configured_flm_extractor, sample_flm_entity, tmp_path
+    ):
+        """A 0-byte file is not a finished download — fetch it again."""
+        configured_flm_extractor.flm_params.update(
+            {"postprocess": "file", "map_format": "tiff", "output_path": str(tmp_path), "skip_existing": True}
+        )
+        name = configured_flm_extractor._flm_output_basename(sample_flm_entity, FLM_IMAGE_ID) + ".tif"
+        (tmp_path / name).write_bytes(b"")
+        mock_retry.return_value = MagicMock(content=b"TIFF_BYTES")
+
+        with patch.object(configured_flm_extractor, "ensure_token_valid"):
+            result = configured_flm_extractor.process_single_entity_flm(sample_flm_entity)
+
+        mock_retry.assert_called_once()
+        assert result["data"].iloc[0]["status"] == "downloaded"
+        assert (tmp_path / name).read_bytes() == b"TIFF_BYTES"
+
+    @patch("earthdaily.agriculture.extractors.FLM_functions.normalize_with_metadata", side_effect=lambda r, df: df)
+    @patch("earthdaily.agriculture.extractors.FLM_functions.validate_wkt", side_effect=lambda x: x)
+    @patch("earthdaily.agriculture.extractors.FLM_functions.retry_with_backoff_no_retry_on_400")
+    def test_skip_existing_false_always_downloads(
+        self, mock_retry, mock_wkt, mock_normalize, configured_flm_extractor, sample_flm_entity, tmp_path
+    ):
+        configured_flm_extractor.flm_params.update(
+            {"postprocess": "file", "map_format": "tiff", "output_path": str(tmp_path), "skip_existing": False}
+        )
+        name = configured_flm_extractor._flm_output_basename(sample_flm_entity, FLM_IMAGE_ID) + ".tif"
+        (tmp_path / name).write_bytes(b"OLD")
+        mock_retry.return_value = MagicMock(content=b"NEW")
+
+        with patch.object(configured_flm_extractor, "ensure_token_valid"):
+            result = configured_flm_extractor.process_single_entity_flm(sample_flm_entity)
+
+        mock_retry.assert_called_once()
+        assert result["data"].iloc[0]["status"] == "downloaded"
+        assert (tmp_path / name).read_bytes() == b"NEW"
+
 
 class TestProcessSingleEntityFlmInputValidation:
     """Common input-validation paths for process_single_entity_flm."""

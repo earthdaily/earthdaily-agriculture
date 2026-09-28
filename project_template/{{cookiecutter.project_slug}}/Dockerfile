@@ -20,10 +20,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgdal32 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the wheel built in stage 1, plus the earthdaily-agriculture wheel pinned in dist/.
+# Install the wheel built in stage 1, then earthdaily-agriculture.
 COPY --from=builder /build/dist/*.whl /tmp/
+{% if cookiecutter.edagro_source_path %}
+# Local wheel — requires dist/ to be present in the build context.
 COPY dist/earthdaily_agriculture-{{ cookiecutter.edagro_wheel_version }}-py3-none-any.whl /tmp/
 RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl
+{% else %}
+RUN pip install --no-cache-dir /tmp/*.whl \
+    && pip install --no-cache-dir earthdaily-agriculture=={{ cookiecutter.edagro_wheel_version }} \
+    && rm /tmp/*.whl
+{% endif %}
 
 # Non-root user — required by many orchestrators (Cloud Run, OpenShift).
 RUN useradd --create-home --shell /bin/bash edagro

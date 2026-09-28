@@ -38,6 +38,21 @@ def require_coverage_params(func):
     return wrapper
 
 
+# image.sensor values accepted by catalog-imagery (MapProduct v5 TimeSeriesSensors enum,
+# upper-cased like the 'sensor' field of the response). An unknown value is not rejected by
+# the API — it silently returns no images — so names are checked here instead.
+VALID_SENSORS = {
+    "LANDSAT_5", "LANDSAT_7", "LANDSAT_8", "LANDSAT_9", "SENTINEL_2",
+    "DEIMOS", "DEIMOS_1", "DEIMOS_1_S", "DEIMOS_1_P", "DMC", "DMC2",
+    "RAPIDEYE_3A", "RAPIDEYE_1B", "RESOURCESAT2", "CBERS4", "M4C", "MICASENSE",
+    "ALSAT_1B", "KAZSTSAT", "PARROTSEQUOIA", "EARTHDAILY_SIMULATED",
+    "GAOFEN_1_WFV1", "GAOFEN_1_WFV2", "GAOFEN_1_WFV3", "GAOFEN_1_WFV4",
+    "GAOFEN_6_WFV1", "GAOFEN_6_WFV2", "GAOFEN_6_WFV3",
+    "HJ2A_CCD1", "HJ2A_CCD2", "HJ2A_CCD3", "HJ2A_CCD4",
+    "HJ2B_CCD1", "HJ2B_CCD2", "HJ2B_CCD3", "HJ2B_CCD4",
+}  # fmt: skip
+
+
 class CoverageExtractor(BaseExtractor):
     """
     Extracts satellite image coverage analytics for agricultural entities.
@@ -72,6 +87,9 @@ class CoverageExtractor(BaseExtractor):
         recalibration (bool): Apply cross-sensor recalibration to coverage metrics. Default: False
         historical_seasons (list[int]): Prior season years used when filter='crop_coverage'
             (required for that filter, e.g. [2024, 2023, 2022]). Default: None
+        sensors (str | list[str]): Keep only images from these sensors (e.g. 'SENTINEL_2' or
+            ['SENTINEL_2', 'LANDSAT_9']), case-insensitive. Sent to the API as image.sensor=$in:... and
+            applied before the duplicate filter. Default: None (all sensors)
         use_cache (bool): Reuse cached API responses and cache new results to avoid
             re-fetching. None uses the extractor's instance default. Default: None
 
@@ -112,6 +130,7 @@ class CoverageExtractor(BaseExtractor):
         partial_frequency=50,
         recalibration=False,
         historical_seasons=None,
+        sensors=None,
         column_mapping=None,
         output_mapping=None,
         exclude_columns=None,
@@ -124,6 +143,8 @@ class CoverageExtractor(BaseExtractor):
         When filter='crop_coverage', historical_seasons must be provided.
         The extraction period is computed per entity from start_date/end_date fields
         across all historical years (smallest year start to largest year end).
+
+        sensors restricts the output to the given sensor(s) (e.g. 'SENTINEL_2').
         """
         valid_indexes = {"NDVI", "EVI", "CVI", "CVIN", "GNDVI", "LAI", "NDWI", "NDMI", "S2REP"}
         if vegetation_index not in valid_indexes:
@@ -183,6 +204,27 @@ class CoverageExtractor(BaseExtractor):
                 "Provide a list of years (e.g., [2024, 2023, 2022])."
             )
 
+        # Sensors validation — normalized to the upper-case values of the 'sensor' column
+        if sensors is not None:
+            if isinstance(sensors, str):
+                sensors = [sensors]
+            if not isinstance(sensors, (list, tuple, set)) or not sensors:
+                raise ValueError(f"Invalid sensors '{sensors}'. Must be a sensor name or a non-empty list of them.")
+            if not all(isinstance(s, str) and s.strip() for s in sensors):
+                raise ValueError(f"Invalid sensors '{sensors}'. Every sensor must be a non-empty string.")
+            sensors = sorted({s.strip().upper() for s in sensors})
+            unknown = [s for s in sensors if s not in VALID_SENSORS]
+            if unknown:
+                raise ValueError(f"Unknown sensors {unknown}. Must be among {sorted(VALID_SENSORS)}")
+
+        # The duplicate filter only keeps pairs of images from *different* sensors, so a
+        # single-sensor selection would always come back empty.
+        if filter == "duplicate" and sensors is not None and len(sensors) < 2:
+            raise ValueError(
+                f"filter='duplicate' pairs images from different sensors and cannot work with a single "
+                f"sensor (sensors={sensors}). Use filter='none', or select at least two sensors."
+            )
+
         if column_mapping:
             self.set_column_mapping(column_mapping)
 
@@ -201,6 +243,9 @@ class CoverageExtractor(BaseExtractor):
             "recalibration": recalibration,
             "historical_seasons": historical_seasons,
         }
+        # Only stored when set, so runs without a sensor filter keep their existing cache key
+        if sensors is not None:
+            self.coverage_params["sensors"] = sensors
 
         # Enable/disable cache if explicitly provided
         self.apply_cache_setting(use_cache)
@@ -288,6 +333,11 @@ class CoverageExtractor(BaseExtractor):
             date_param,
             f"mask={params['mask']}",
         ]
+
+        # Server-side sensor filter
+        sensors = params.get("sensors")
+        if sensors:
+            query_params.append(f"image.sensor=$in:{'|'.join(sensors)}")
 
         # --- Full URL ---
         full_url = f"{url}?{'&'.join(query_params)}"
@@ -454,6 +504,15 @@ class CoverageExtractor(BaseExtractor):
                 (df["coverage_percent"] >= params["clear_cover_min"])
                 & (df["coverage_percent"] <= params["clear_cover_max"])
             ]
+
+        # Sensor filtering — already applied server-side via image.sensor; kept as a guard
+        # (cached/replayed responses, sensor inferred from image_id). Runs before the
+        # duplicate filter, which pairs across sensors.
+        sensors = params.get("sensors")
+        if sensors and not df.empty:
+            original_count = len(df)
+            df = df[df["sensor"].str.upper().isin(sensors)]
+            log.debug(f"Sensor filter {sensors} reduced {original_count} -> {len(df)} images")
 
         log.debug(f"Created DataFrame with {len(df)} rows for entity {entity_id}")
 
