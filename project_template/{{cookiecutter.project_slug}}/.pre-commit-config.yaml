@@ -1,0 +1,47 @@
+# Pre-commit hooks for {{ cookiecutter.project_name }}
+# ------------------------------------------------------------------
+# Setup (once per clone):
+#   pip install pre-commit
+#   pre-commit install
+#
+# Hooks run automatically on `git commit`. To run against all files
+# without committing:
+#   pre-commit run --all-files
+# ------------------------------------------------------------------
+
+repos:
+  # Strip outputs, execution counts, and noisy metadata from notebooks
+  # so they don't bloat diffs or leak data (API responses, customer info).
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.7.1
+    hooks:
+      - id: nbstripout
+        # Cells tagged `{"metadata": {"keep_output": true}}` keep their outputs.
+        args: ["--keep-metadata-keys", "keep_output"]
+
+  # Ruff — lint + format. Matches the earthdaily-agriculture-internal convention.
+  # Starter rule set is permissive (E, F, I) so existing code passes;
+  # tighten rules in pyproject.toml [tool.ruff] over time.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Refresh the auto-generated AI context (CLAUDE.md + .claude/skills/earthdaily-agriculture/)
+  # when the earthdaily.agriculture wheel is bumped. Triggers ONLY on changes to
+  # `dist/*.whl` or `requirements.txt` — keeps everyday commits fast.
+  #
+  # Requires a local earthdaily-agriculture-internal clone reachable via EDAGRO_CLIENT_PATH,
+  # the script's --template flag, or one of the common auto-discovered
+  # locations (~/Github/earthdaily-agriculture-internal, etc.). If no clone is found the hook
+  # prints a warning and exits 0 so the commit still goes through.
+  - repo: local
+    hooks:
+      - id: refresh-ai-context
+        name: Refresh AI context (CLAUDE.md + /earthdaily-agriculture skill)
+        language: system
+        entry: python app/refresh_ai_context.py
+        pass_filenames: false
+        files: ^(dist/.*\.whl|requirements\.txt)$

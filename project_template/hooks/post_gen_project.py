@@ -197,10 +197,7 @@ def _copy_docs(target: Path) -> None:
         # so there is nothing to say.
         return
     if not INCLUDE_INTERNAL_DOCS:
-        print(
-            "[earthdaily-agriculture] Internal docs found but include_internal_docs=no "
-            "— skipping docs/internal/."
-        )
+        print("[earthdaily-agriculture] Internal docs found but include_internal_docs=no " "— skipping docs/internal/.")
         return
 
     n_internal = _copy_tree_into(internal_src, docs_target / "internal", skip=DOCS_PRESERVE)
@@ -245,7 +242,9 @@ def _prune_for_variant(target: Path) -> None:
             d.rmdir()
             removed.append(f"{rel.as_posix()}/")
 
-    print(f"[earthdaily-agriculture] back-office variant: pruned {len(removed)} extraction-only path(s): {', '.join(removed)}")
+    print(
+        f"[earthdaily-agriculture] back-office variant: pruned {len(removed)} extraction-only path(s): {', '.join(removed)}"
+    )
 
 
 def _copy_backoffice(target: Path) -> None:
@@ -360,6 +359,56 @@ def _run_personal_skill_target() -> None:
         )
 
 
+# Directories a project is expected to have on day one. `setup_environment()`
+# creates most of them at run time, but a scaffold should not look half-built
+# before the first run, and `docs/study/` is not created by anything else.
+WORKSPACE_DIRS = (
+    "inputs",
+    "results",
+    "partials",
+    "logs",
+    "cache",
+    "dist",
+    "docs/study",
+)
+
+
+def _create_workspace_dirs(target: Path) -> None:
+    """Create the workspace directories, with a .gitkeep in each.
+
+    These used to be carried as committed `.gitkeep` files in the template. They
+    never worked, for three separate reasons, none of them visible without
+    checking `git ls-files`:
+
+    1. The template ships a `.gitignore` written for GENERATED projects, and git
+       applies it to the template directory itself -- so `results/`, `partials/`,
+       `cache/` and `logs/` were ignored *inside the template* and their
+       `.gitkeep` files were never committed.
+    2. The repository root `.gitignore` swallowed `inputs/` and `dist/` the same
+       way.
+    3. `glob.glob` (used by the strip script) does not match a leading dot, so
+       even a committed `.gitkeep` would not have reached the public payload.
+
+    Creating them here sidesteps all three: nothing needs to be committable or
+    glob-visible, and it works identically for the public template and the
+    internal one. The `.gitkeep` files are written rather than just the
+    directories so the layout survives a user committing their project -- though
+    note their own `.gitignore` ignores the output directories by design, which
+    is why this is about the scaffold looking complete, not about version
+    control.
+    """
+    created = []
+    for rel in WORKSPACE_DIRS:
+        d = target / rel
+        if d.is_dir():
+            continue
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ".gitkeep").touch()
+        created.append(rel)
+    if created:
+        print(f"[earthdaily-agriculture] created workspace directories: {', '.join(created)}")
+
+
 def main() -> None:
     target = Path.cwd().resolve()
 
@@ -369,6 +418,13 @@ def main() -> None:
         _copy_docs(target)
     except OSError as exc:
         print(f"[earthdaily-agriculture] WARNING: doc copy failed ({exc}). Project still created.")
+
+    # Workspace directories first: the variant pruning below reasons about which
+    # directories are empty, so they must exist before it runs.
+    try:
+        _create_workspace_dirs(target)
+    except OSError as exc:
+        print(f"[earthdaily-agriculture] WARNING: could not create workspace dirs ({exc}). Project still created.")
 
     # Variant shaping, before context generation so the generated CLAUDE.md
     # describes the project that actually exists on disk.
@@ -384,7 +440,7 @@ def main() -> None:
             "Skipping CLAUDE.md / skill generation. "
             "Re-run later with: "
             f"python -m {GENERATOR_MODULE} --project-target {target} "
-            f"--project-name \"{PROJECT_NAME}\" --environment {ENVIRONMENT} "
+            f'--project-name "{PROJECT_NAME}" --environment {ENVIRONMENT} '
             f"--wheel-version {WHEEL_VERSION}"
         )
         return
@@ -399,8 +455,7 @@ def main() -> None:
             print(f"[earthdaily-agriculture] Project context generated in {target}")
     except FileNotFoundError:
         print(
-            "[earthdaily-agriculture] WARNING: could not locate the Python interpreter; "
-            "skipping context generation."
+            "[earthdaily-agriculture] WARNING: could not locate the Python interpreter; " "skipping context generation."
         )
 
 

@@ -66,7 +66,7 @@ The mechanism: `WorkflowManager` instantiates a boto3 client at construction tim
 There's no EarthDaily Agriculture-specific cloud credentials API. Reads and writes both honour the chain that AWS SDKs already use:
 
 1. Explicit env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`)
-2. `.env` file at `src/.env` (loaded by `setup_environment` via `python-dotenv`)
+2. `.env` file at your project root (loaded by `setup_environment` via `python-dotenv`; it also accepts `src/.env`, which is where a repository checkout keeps credentials beside the source)
 3. `~/.aws/credentials` profile
 4. EC2 instance profile / ECS task role / EKS pod identity / Lambda execution role
 
@@ -88,7 +88,7 @@ manager.config["output_result_dir"]  = "az://my-container/runs/2026-06-30/result
 manager.config["partial_result_dir"] = "az://my-container/runs/2026-06-30/partials"
 ```
 
-The account is non-HNS Blob storage, so use the `az://` scheme (`abfs://` also works for ADLS Gen2). The four keys are templated in `src/template.env`.
+The account is non-HNS Blob storage, so use the `az://` scheme (`abfs://` also works for ADLS Gen2). The four keys are templated in `template.env` at the repository root — copy it to `.env` and fill it in.
 
 ### 4. Partial saves, retries, and resumability work identically
 
@@ -160,7 +160,7 @@ print(manager.config["output_result_dir"])   # local path
 ```
 
 **Pinning to local explicitly.** If you want a dev notebook to ignore any
-`EDAGRO_OUTPUT_PREFIX` that might leak in from `src/.env` or the parent shell
+`EDAGRO_OUTPUT_PREFIX` that might leak in from `.env` or the parent shell
 (e.g. a teammate set it for their own container test), pass `storage="local"`:
 
 ```python
@@ -183,7 +183,7 @@ pip install -e ".[s3]"          # pulls s3fs + fsspec
 
 Make sure AWS credentials are reachable via *one* of:
 
-- `src/.env` with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` (existing pattern)
+- `.env` at your project root with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
 - `~/.aws/credentials` profile
 - IAM role / instance profile (containers / EC2)
 - AWS SSO logged in (`aws sso login`)

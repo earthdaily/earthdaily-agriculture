@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install the wheel built in stage 1, then earthdaily-agriculture.
 COPY --from=builder /build/dist/*.whl /tmp/
-{% if cookiecutter.edagro_source_path %}
+{% if cookiecutter.edagro_install_mode == 'wheel' %}
 # Local wheel — requires dist/ to be present in the build context.
 COPY dist/earthdaily_agriculture-{{ cookiecutter.edagro_wheel_version }}-py3-none-any.whl /tmp/
 RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl

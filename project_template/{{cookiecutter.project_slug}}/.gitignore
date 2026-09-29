@@ -1,0 +1,27 @@
+# Credentials
+.env
+
+# Output directories
+results/
+partials/
+cache/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code — local tooling config (permissions, hooks, generated skills).
+# The post-gen hook writes .claude/skills/edagro/ for the /edagro skill;
+# nothing under .claude/ needs to live in version control.
+.claude/
+
+# Personal scratch todo files (any case — never tracked, not for PRs)
+todo.md
+Todo.md
+TODO.md

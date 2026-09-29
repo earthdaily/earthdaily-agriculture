@@ -1,0 +1,106 @@
+name: {{ cookiecutter.project_slug }} daily extraction
+
+# Pattern A scheduler from docs/14 - Deployment_patterns.md.
+# Runs `python -m app.run_pipeline` on a cron, scrapes REPORT_PATH=,
+# uploads the artifact, and (when enabled) copies to S3.
+#
+# ─────────────────────────────────────────────────────────────────────
+# DISABLED BY DEFAULT — only `workflow_dispatch` is active so you can
+# smoke-test before turning on cron. See docs/14 §"Enabling Pattern A
+# on a fresh project" for the full enable checklist:
+#
+#   1. Add the API secrets (PROD_API_*) under
+#      Settings > Secrets and variables > Actions.
+#   2. Smoke-test from the Actions tab: Run workflow > limit=5.
+#   3. Add the S3 secrets and uncomment the "S3 delivery" block below.
+#   4. Add SLACK_WEBHOOK_URL and uncomment the failure-notification block.
+#   5. Uncomment the `schedule:` block below and tune the cron expression.
+#   6. Push to the default branch — schedules don't fire from feature branches.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  # schedule:
+  #   - cron: "0 6 * * *"      # 06:00 UTC — avoid 0/6/12 UTC busy windows (try 5 or 7 instead).
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Optional smoke-test limit"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write              # only needed when you switch to AWS OIDC
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300       # GH-imposed hard ceiling on hosted runners.
+    env:
+      ENVIRONMENT: {{ cookiecutter.environment }}
+      PROD_API_CLIENT_ID:     ${{ '{{' }} secrets.PROD_API_CLIENT_ID {{ '}}' }}
+      PROD_API_CLIENT_SECRET: ${{ '{{' }} secrets.PROD_API_CLIENT_SECRET {{ '}}' }}
+      PROD_API_USERNAME:      ${{ '{{' }} secrets.PROD_API_USERNAME {{ '}}' }}
+      PROD_API_PASSWORD:      ${{ '{{' }} secrets.PROD_API_PASSWORD {{ '}}' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "{{ cookiecutter.python_version }}"
+          # No `cache: pip` — installs use `--no-cache-dir`, so the pip cache
+          # directory is never created and the post-job cleanup warns. Add
+          # `cache: pip` only if you drop `--no-cache-dir`.
+
+{% if cookiecutter.edagro_install_mode == 'wheel' %}
+      # Local wheel — the runner needs dist/ committed or built in an earlier step.
+      - run: pip install --no-cache-dir dist/earthdaily_agriculture-*.whl
+{% else %}
+      - run: pip install --no-cache-dir earthdaily-agriculture=={{ cookiecutter.edagro_wheel_version }}
+{% endif %}
+
+      - id: run
+        run: |
+          set -o pipefail
+          ARGS=""
+          [ -n "${{ '{{' }} github.event.inputs.limit {{ '}}' }}" ] && ARGS="--limit ${{ '{{' }} github.event.inputs.limit {{ '}}' }}"
+          python -m app.run_pipeline --prefix "run_$(date -u +%Y%m%d)" $ARGS | tee run.log
+          REPORT=$(grep '^REPORT_PATH=' run.log | tail -1 | cut -d= -f2-)
+          [ -z "$REPORT" ] && { echo "no REPORT_PATH"; exit 1; }
+          echo "report_path=$REPORT" >> "$GITHUB_OUTPUT"
+          echo "report_basename=$(basename "$REPORT")" >> "$GITHUB_OUTPUT"
+
+      # Always upload the artifact, even on failure — first stop for triage.
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: {{ cookiecutter.project_slug }}-${{ '{{' }} github.run_id {{ '}}' }}
+          path: |
+            results/*.csv
+            logs/
+          retention-days: 14
+
+      # ────────────────────────────────────────────────────────────────────
+      # S3 delivery (uncomment once secrets are in place)
+      # ────────────────────────────────────────────────────────────────────
+      # - uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id:     ${{ '{{' }} secrets.AWS_ACCESS_KEY_ID {{ '}}' }}
+      #     aws-secret-access-key: ${{ '{{' }} secrets.AWS_SECRET_ACCESS_KEY {{ '}}' }}
+      #     aws-region:            ${{ '{{' }} secrets.AWS_REGION {{ '}}' }}
+      # - env:
+      #     S3_BUCKET: ${{ '{{' }} secrets.S3_BUCKET {{ '}}' }}
+      #     S3_PREFIX: ${{ '{{' }} secrets.S3_PREFIX {{ '}}' }}
+      #   run: |
+      #     DATE=$(date -u +%Y-%m-%d)
+      #     aws s3 cp "${{ '{{' }} steps.run.outputs.report_path {{ '}}' }}" \
+      #       "s3://${S3_BUCKET}/${S3_PREFIX}/${DATE}/${{ '{{' }} steps.run.outputs.report_basename {{ '}}' }}"
+
+      # ────────────────────────────────────────────────────────────────────
+      # Slack notification on failure (uncomment + add SLACK_WEBHOOK_URL secret)
+      # Don't skip this — a silently failing cron is worse than no cron.
+      # ────────────────────────────────────────────────────────────────────
+      # - if: failure()
+      #   run: |
+      #     curl -X POST -H 'Content-type: application/json' \
+      #       --data "{\"text\":\"{{ cookiecutter.project_slug }} extraction failed: ${{ '{{' }} github.server_url {{ '}}' }}/${{ '{{' }} github.repository {{ '}}' }}/actions/runs/${{ '{{' }} github.run_id {{ '}}' }}\"}" \
+      #       "${{ '{{' }} secrets.SLACK_WEBHOOK_URL {{ '}}' }}"

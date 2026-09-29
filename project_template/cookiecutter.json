@@ -7,6 +7,10 @@
     "environment": "prod",
     "python_version": "3.12",
     "edagro_wheel_version": "2.6.0",
+    "edagro_install_mode": [
+        "pypi",
+        "wheel"
+    ],
     "edagro_source_path": "",
     "include_internal_docs": "yes",
     "max_workers": "10",

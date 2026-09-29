@@ -1,0 +1,43 @@
+# {{ cookiecutter.project_name }} — Docker build context exclusions.
+#
+# Without this, the image balloons and may leak credentials into layers.
+# See docs/14 - Deployment_patterns.md (Pattern B) for the rationale.
+
+# Credentials — NEVER ship these
+.env
+src/.env
+**/.env
+
+# Local workspace output (the container creates its own paths,
+# or writes to s3:// via EDAGRO_OUTPUT_PREFIX)
+inputs/
+results/
+partials/
+logs/
+cache/
+
+# Build artifacts
+build/
+*.egg-info/
+
+# Notebooks & dev material
+notebooks/
+customers/
+tools/
+backoffice/
+docs/
+*.ipynb
+*.ipynb_checkpoints
+
+# VCS & IDE
+.git/
+.github/
+.vscode/
+.idea/
+.claude/
+
+# Python cruft
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/

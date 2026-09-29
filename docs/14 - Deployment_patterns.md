@@ -299,7 +299,7 @@ Without this, the image balloons and may leak credentials into layers:
 ```
 # Credentials — NEVER ship these
 .env
-src/.env
+.env
 **/.env
 
 # Local workspace output

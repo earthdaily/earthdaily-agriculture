@@ -204,6 +204,15 @@ def main() -> int:
             "docs to copy. Use this for a project you intend to hand to a client."
         ),
     )
+    parser.add_argument(
+        "--use-local-wheel",
+        action="store_true",
+        help=(
+            "Install earthdaily-agriculture from a locally built wheel in dist/ "
+            "instead of PyPI. For contributors working against a source checkout; "
+            "requires `python -m build` to have been run there."
+        ),
+    )
     args = parser.parse_args()
 
     target = args.target.resolve()
@@ -264,6 +273,14 @@ def main() -> int:
     }
     if edagro_source_str is not None:
         extra_context["edagro_source_path"] = edagro_source_str
+    # `edagro_source_path` answers "where is src/, for AI-context generation" and
+    # is set whenever the template came from ANY local clone -- including a public
+    # user who cloned the public repo just to get the template. It must NOT decide
+    # how the package is installed: keying the requirements/Dockerfile/CI off it
+    # gave that user a `dist/*.whl` line for a wheel they never built. Installing
+    # from a local wheel is now an explicit opt-in.
+    if args.use_local_wheel:
+        extra_context["edagro_install_mode"] = "wheel"
     # Left as None unless --no-internal-docs was passed, so the template default wins.
     if args.include_internal_docs is False:
         extra_context["include_internal_docs"] = "no"
