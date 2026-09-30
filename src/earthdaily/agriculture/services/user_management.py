@@ -71,7 +71,7 @@ class UserManager(BaseExtractor):
         """Initialize UserManager."""
         super().__init__(bearer_token, token_expiration, config, workflow_ref)
 
-        base = agro_urls["eda_data_management_url_fields"][self.env].rstrip("/")
+        base = agro_urls["eda_data_management_url"][self.env]
         self.base_url = f"{base}/users"
 
         self.csv_separator = ","

@@ -62,7 +62,7 @@ def get_seasonfield_list(
                                          sowing_date_lte="2025-06-30",
                                          crop_id="SOYBEANS")
     """
-    url = agro_urls["eda_data_management_url_fields"][env]
+    url = agro_urls["eda_data_management_url"][env]
     headers = {"Content-Type": "application/json", "Authorization": "Bearer " + bearer_token}
 
     # Base parameters (same as original)
@@ -244,7 +244,7 @@ class EntityManager(BaseExtractor):
         self.user_manager = user_manager
 
         # API base URL
-        self.mdm_url = agro_urls["eda_data_management_url_fields"][self.env]
+        self.mdm_url = agro_urls["eda_data_management_url"][self.env]
 
         # Default batch size for bulk operations
         self.batch_size = 5000

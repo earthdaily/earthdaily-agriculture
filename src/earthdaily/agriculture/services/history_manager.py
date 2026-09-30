@@ -179,7 +179,7 @@ class HistoryManager(BaseExtractor):
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
         super().__init__(bearer_token, token_expiration, config, workflow_ref)
         self.base_url = agro_urls["history_url"][self.env].rstrip("/")
-        self.mdm_users_url = agro_urls["eda_data_management_url_fields"][self.env].rstrip("/") + "/users"
+        self.mdm_users_url = agro_urls["eda_data_management_url"][self.env] + "/users"
         # legacy id -> externalIds.id. One lookup per user per session; the
         # mapping cannot change under us.
         self._external_id_cache: dict[str, str] = {}

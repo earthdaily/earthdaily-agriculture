@@ -1,8 +1,7 @@
 """
 - `eda_data_management_url`: url to get business entity like fields
-- `layers_url`: geosys field border API urls to extract field borders from a given location, based on field layer produced by Geosys.
-- `deep_resolution_field_borders_urls`: geosys field border API urls to extract field borders from a given location, based on field layer produced by Digifarm.
-- `location_based_border_url`: alias for the AutomaticBoundary endpoint (`/field-borders/v1/AutomaticBoundary`) used by `LocationBasedBorderExtractor` to derive a polygon from a point WKT.
+- `layer_service_url`: geosys layers API urls to extract field borders from a given location, based on field layer produced by Geosys.
+- `location_based_border_url`: the AutomaticBoundary endpoint (`/field-borders/v1/AutomaticBoundary`) used by `LocationBasedBorderExtractor` to derive a polygon from a point WKT.
 - `crop_id_url`: url to fetch crop information for a given geometry
 - `change_index_url`: url for change index calculations between NDVI images
 """
@@ -12,17 +11,6 @@ agro_urls = {
         "preprod": "https://api-pp.geosys-na.net/master-data-management/v6",
         "prod": "https://api.geosys-na.net/master-data-management/v6",
     },
-    "eda_data_management_url_fields": {
-        "preprod": "https://api-pp.geosys-na.net/master-data-management/v6/",
-        "prod": "https://api.geosys-na.net/master-data-management/v6/",
-    },
-    "layers_url": {"preprod": "https://api-pp.geosys-na.net/layers/v1", "prod": "https://api.geosys-na.net/layers/v1"},
-    "deep_resolution_field_borders_urls": {
-        "preprod": "https://api-pp.geosys-na.net/field-borders/v1/AutomaticBoundary",
-        "prod": "https://api.geosys-na.net/field-borders/v1/AutomaticBoundary",
-    },
-    # Same endpoint as `deep_resolution_field_borders_urls` — kept as a clearer
-    # alias for the new LocationBasedBorderExtractor (point WKT -> polygon WKT).
     "location_based_border_url": {
         "preprod": "https://api-pp.geosys-na.net/field-borders/v1/AutomaticBoundary",
         "prod": "https://api.geosys-na.net/field-borders/v1/AutomaticBoundary",
@@ -117,7 +105,7 @@ agro_urls = {
         "prod": "https://api.geosys-na.net/field-level-maps/v5/time-serie-radar",
     },
     "planted_urls": {
-        "preprod": "https://planted-area.aws-dev.geosys.com/",
+        "preprod": "https://planted-area.aws-dev.geosys.com",
         "prod": "https://planted-area.aws.geosys.com",
     },
     "greenness_urls": {

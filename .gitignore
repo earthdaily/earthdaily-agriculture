@@ -19,6 +19,10 @@ cache/
 .env.*
 !template.env
 !src/template.env
+# The project template's credentials EXAMPLE (docs/01: `cp .env.template .env`).
+# Without this, `.env.*` drops it at the mirror's `git add -A` even though the
+# payload contains it — see assert_nothing_gitignored().
+!project_template/**/.env.template
 
 # Tooling caches
 .pytest_cache/
