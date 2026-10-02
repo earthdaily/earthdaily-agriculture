@@ -52,7 +52,7 @@ class EmergenceExtractor(BaseExtractor):
     detection modes and LR / MR data sources. The season window comes from
     setup (``season_*``, ``year``), never from a per-entity sowing date.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Emergence/
+    Documentation: https://docs.earthdaily.com/agro/library/Emergence/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook:      EDAgriculture_Emergence_Processor_Function_Dev.ipynb
     API endpoint:  {agro_urls["emergence_url"][env]}/... (env-dependent)
 

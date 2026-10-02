@@ -4,6 +4,8 @@ Tests for DifferenceExtractor validation logic:
     - require_difference_params decorator
 """
 
+import os
+
 import pytest
 
 pytestmark = pytest.mark.public
@@ -109,7 +111,14 @@ class TestSetupDifferenceParameters:
         with pytest.raises(ValueError, match="map_format"):
             difference_extractor.setup_difference_parameters(postprocess="file", output_path="/tmp/out")
 
-    def test_file_mode_requires_output_path(self, difference_extractor):
+    def test_file_mode_defaults_to_results_maps(self, difference_extractor):
+        """No output_path -> <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX."""
+        difference_extractor.setup_difference_parameters(postprocess="file", map_format="png")
+        expected = os.path.join(difference_extractor.output_path, "maps")
+        assert difference_extractor.difference_params["output_path"] == expected
+
+    def test_file_mode_without_any_path_still_raises(self, difference_extractor):
+        difference_extractor.output_path = None
         with pytest.raises(ValueError, match="output_path"):
             difference_extractor.setup_difference_parameters(postprocess="file", map_format="png")
 

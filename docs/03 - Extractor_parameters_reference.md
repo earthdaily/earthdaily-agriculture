@@ -214,7 +214,7 @@ Two things follow, and they remove most of the remaining glue:
 | `stats` | One field-level row per entity: variability, productivity/variability indices, and `zone_{n}_*` columns. Default. |
 | `stats_geo` | One row **per zone**, carrying that zone's geometry (segments merged into a `GEOMETRYCOLLECTION`) plus its mean/max/min/area, with the field-level stats repeated on every row. |
 | `links` | Direct download links (requires `directLinks=True`, set automatically). |
-| `file` | Downloads the map; requires `map_format` and `output_path`. |
+| `file` | Downloads the map; requires `map_format`. `output_path` defaults to `<results dir>/maps`, which follows `EDAGRO_OUTPUT_PREFIX`. |
 
 ---
 
@@ -508,6 +508,12 @@ Compares a reference image (one per entity, via `reference_date`) against the ne
 | `nb_days_sowing_emergence` | `20` | Days from sowing to emergence |
 | `soil_type` | `None` | Soil type classification |
 | `cycle` | `None` | Crop cycle type |
+| `emergence_date` | `None` | Run-wide emergence date (`YYYY-MM-DD`) for rows without their own; a per-row `emergence_date` wins |
+
+**Required entity field:** `emergence_date` on every row, unless set here or in the run's
+`params`. `crop`, `soil_type`, `cycle` and `nb_days_sowing_emergence` may also be set per
+row and override the values above. In a workflow, `run.params.params` overrides any of
+these for one step.
 
 ---
 
@@ -552,7 +558,7 @@ Legend: **S** = season window params (`season_duration`, `season_start_day`, `se
 | ChangeIndexExtractor | `reference_date` (per entity) | `map_type` | | `collections` | `max_period_reference`, `max_period_previous`, `min_period_previous`, `same_sensor`, `parameter_profile`, `publish_af` |
 | HistoricalScoreExtractor | | | **S** | `data_source` | `threshold_start`, `historical_seasons`, `detail_level` |
 | InseasonScoreExtractor | | | **S** | `data_source` | `nb_historical_year`, `threshold_start`, `historical_seasons`, `detail_level` |
-| ZARCExtractor | | | | | `crop`, `nb_days_sowing_emergence`, `soil_type`, `cycle` |
+| ZARCExtractor | `emergence_date` (per entity) | | | | `crop`, `nb_days_sowing_emergence`, `soil_type`, `cycle`, `emergence_date` |
 | BaresoilExtractor | | | **S** | | `filter` |
 
 ---

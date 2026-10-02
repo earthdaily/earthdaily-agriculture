@@ -3,13 +3,14 @@ import json
 import os
 import tempfile
 import time
-from datetime import datetime
+from datetime import date, datetime
 from functools import wraps
 from pathlib import Path
 
 import pandas as pd
 from loguru import logger
 
+from earthdaily.agriculture.core._fs import apply_output_prefix
 from earthdaily.agriculture.core.api_utils import export_results
 from earthdaily.agriculture.core.logging_setup import setup_logging
 
@@ -155,12 +156,28 @@ class BaseExtractor:
         self.config = config
         self.workflow_ref = workflow_ref
 
-        # 🌍 Environment
-        self.env = config.get("env", "production")
+        # 🌍 Environment. "prod" / "preprod" are the keys every URL table uses; the old
+        # default, "production", is not one of them, so a config without "env" crashed
+        # the first URL lookup with KeyError: 'production'.
+        self.env = config.get("env", "prod")
 
-        # 📂 Folder paths
-        self.partial_path = config.get("partial_result_dir")
-        self.output_path = config.get("output_result_dir")
+        # 📂 Folder paths. A config from setup_environment() / WorkflowManager has
+        # already applied EDAGRO_OUTPUT_PREFIX; a hand-built one (a stateless container
+        # calling the extractor directly) may carry no path at all, and then falls back
+        # to the prefix rather than to no path — a container's disk dies with it.
+        # All or nothing: a config that sets ANY of the three paths is taken as the
+        # whole truth. Filling only the missing keys split a run in two (local results,
+        # partials and failed IDs on S3), so a retry looked for its failed IDs in the
+        # wrong place.
+        _path_keys = ("output_result_dir", "partial_result_dir", "cache_dir")
+        _prefixed = {} if any(config.get(k) for k in _path_keys) else apply_output_prefix({})
+        if _prefixed:
+            logger.info(
+                f"📂 No output paths in config — using EDAGRO_OUTPUT_PREFIX: results → "
+                f"{_prefixed['output_result_dir']}, partials → {_prefixed['partial_result_dir']}"
+            )
+        self.partial_path = config.get("partial_result_dir") or _prefixed.get("partial_result_dir")
+        self.output_path = config.get("output_result_dir") or _prefixed.get("output_result_dir")
 
         # 🔐 Credentials from environment variables (kept for backwards compatibility)
         self.client_id = os.getenv("API_CLIENT_ID")
@@ -240,7 +257,7 @@ class BaseExtractor:
         default_cache = os.path.join(
             config.get("project_root", str(Path(__file__).resolve().parent.parent.parent.parent)), "cache"
         )
-        configured_cache_dir = config.get("cache_dir", default_cache)
+        configured_cache_dir = config.get("cache_dir") or _prefixed.get("cache_dir") or default_cache
 
         # Detect remote cache_dir BEFORE wrapping in Path (Path("s3://...")
         # mangles the URI on Windows). When the cache lives on an object store
@@ -453,7 +470,7 @@ class BaseExtractor:
     def normalize_date(value):
         """
         Normalize a date value to YYYY-MM-DD string format.
-        Handles ISO timestamps (e.g. '2025-04-01T00:00:00'), pd.Timestamp, and datetime objects.
+        Handles ISO timestamps (e.g. '2025-04-01T00:00:00'), pd.Timestamp, datetime and date objects.
 
         Args:
             value: Date value (str, pd.Timestamp, datetime, or None).
@@ -472,6 +489,11 @@ class BaseExtractor:
             return value.strftime("%Y-%m-%d")
         if isinstance(value, datetime):
             return value.strftime("%Y-%m-%d")
+        # A plain ``date`` (datetime's base class, so checked after it). YAML turns an
+        # unquoted ``2025-10-01`` into one, and so do parquet date32 columns; passed
+        # through unchanged it later reached strptime() and failed every row.
+        if isinstance(value, date):
+            return value.isoformat()
         if isinstance(value, str) and "T" in value:
             return value.split("T")[0]
         return value
@@ -953,6 +975,8 @@ class BaseExtractor:
             params (dict, optional): Extraction parameters (used for cache filename keying).
             use_cache (bool, optional): Override instance-level use_cache setting.
             **bulk_kwargs: All other keyword arguments passed through to bulk_method.
+                A non-empty ``params_kw`` (the run-level ``params`` override) is folded
+                into the cache key as well.
 
         Returns:
             dict: Same return format as bulk_method, with results from cache + fresh extraction.
@@ -963,6 +987,16 @@ class BaseExtractor:
         if not cache_enabled or self.cache_key_columns is None:
             log.debug("Cache disabled or no cache_key_columns defined — running without cache")
             return bulk_method(entity_list=entity_list, **bulk_kwargs)
+
+        # Callers key the cache on their SETUP params, but a run-level override
+        # (`params_kw`, e.g. a workflow's `run.params.params`) changes what the request
+        # returns too. Without it in the key, a second run with different overrides was
+        # served the first run's cached rows. Serialised with sorted keys so the same
+        # override always maps to the same file; no override leaves the key untouched,
+        # so existing caches stay valid.
+        run_params = bulk_kwargs.get("params_kw")
+        if run_params:
+            params = {**(params or {}), "_run_params": json.dumps(run_params, sort_keys=True, default=str)}
 
         # Step 1: Load cache and evict stale entries
         cached = self._load_cache(params)
@@ -1852,6 +1886,48 @@ class BaseExtractor:
     # -------------------------------
     # 🗺️ MAP FILE WRITER (postprocess="file")
     # -------------------------------
+
+    def resolve_map_output_path(self, output_path=None, log=None):
+        """Directory for ``postprocess="file"`` maps — shared by FLM, Difference, Zoning setup.
+
+        An explicit ``output_path`` wins. Without one, maps go to ``<results dir>/maps``,
+        which follows ``EDAGRO_OUTPUT_PREFIX``: a container that only sets the prefix gets
+        its maps on S3 with no extra parameter. This used to be a hard error, so a container had
+        to pass a path itself — and the notebook habit (a local folder) put the maps on
+        the pod's disk, gone with the pod, while ``saved_files`` still listed them.
+
+        Warns when an explicit ``output_path`` is local while this extractor's results go
+        to remote storage and no ``output_uri`` mirror is set: the run is clearly meant
+        to be stateless, yet its maps would stay on the container's disk. Judged on
+        ``self.output_path`` — what this extractor actually resolved — not on the
+        environment variable, so ``storage="local"`` or explicit local paths with a stray
+        prefix in the shell do not warn.
+
+        Raises:
+            ValueError: no ``output_path`` and no results directory to default to.
+        """
+        from earthdaily.agriculture.core import _fs
+
+        log = log or self.logger
+        resolved = output_path or (_fs.join_path(self.output_path, "maps") if self.output_path else None)
+        if not resolved:
+            error_msg = "postprocess='file' requires output_path to be set (no results directory to default to)"
+            log.error(error_msg)
+            raise ValueError(error_msg)
+
+        if (
+            output_path
+            and not _fs.is_remote_path(output_path)
+            and _fs.is_remote_path(self.output_path)
+            and not getattr(self, "output_uri", None)
+        ):
+            log.warning(
+                f"⚠️ Map files will be saved to a LOCAL path ({output_path}) while results go to "
+                f"{self.output_path}. In a stateless container they are lost with it, and "
+                "saved_files will point at nothing. Omit output_path to save under the results "
+                "path, or set output_uri for a durable copy."
+            )
+        return resolved
 
     def save_map_file(self, save_path, filename, data: bytes) -> str:
         """Save one raster/map file, and mirror it to ``output_uri`` when set.

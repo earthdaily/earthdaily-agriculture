@@ -179,7 +179,7 @@ You set `EDAGRO_OUTPUT_PREFIX=s3://...` but results show up in `<project-root>/r
 
 ### Fix
 
-Set `storage="auto"` (default) or `storage="s3"` on the `WorkflowManager` constructor. The auto-mode honours `EDAGRO_OUTPUT_PREFIX`; the s3-mode hard-requires it (raises if neither the env var nor explicit kwargs are set). See `docs/site/agriculture/13 - Cloud_storage_principles_and_usage.md`.
+Set `storage="auto"` (default) or `storage="s3"` on the `WorkflowManager` constructor. The auto-mode honours `EDAGRO_OUTPUT_PREFIX`; the s3-mode hard-requires a REMOTE destination (raises unless the env var is an `s3://` / `az://` URI or an explicit kwarg is remote — a local prefix is rejected). See `docs/site/agriculture/13 - Cloud_storage_principles_and_usage.md`.
 
 ---
 

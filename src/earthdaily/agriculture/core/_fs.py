@@ -40,6 +40,35 @@ def is_remote_path(path: str | os.PathLike[str] | None) -> bool:
     return any(s.startswith(scheme) for scheme in _REMOTE_SCHEMES)
 
 
+OUTPUT_PREFIX_ENV = "EDAGRO_OUTPUT_PREFIX"
+STORAGE_MODES = ("auto", "local", "s3")
+
+
+def apply_output_prefix(config: dict[str, Any], storage: str = "auto") -> dict[str, Any]:
+    """Route results / partials / cache under ``EDAGRO_OUTPUT_PREFIX``, in place.
+
+    ``EDAGRO_OUTPUT_PREFIX=s3://bucket/runs/2026-01-01`` sets ``output_result_dir``,
+    ``partial_result_dir`` and ``cache_dir`` to ``<prefix>/results``, ``/partials``,
+    ``/cache``. This is the one implementation shared by ``setup_environment()``,
+    ``WorkflowManager`` and ``BaseExtractor``: it used to live only in
+    ``WorkflowManager.__init__``, so an extractor constructed directly (a stateless
+    container) ignored the variable and wrote to local disk.
+
+    ``storage``: ``"auto"`` applies the prefix when set; ``"local"`` ignores it;
+    ``"s3"`` applies it like ``"auto"`` — the "must be remote" check belongs to the
+    caller, which also knows about explicit remote kwargs. Idempotent.
+    """
+    if storage not in STORAGE_MODES:
+        raise ValueError(f"Invalid storage={storage!r}. Choose from 'auto', 'local', 's3'.")
+    prefix = os.environ.get(OUTPUT_PREFIX_ENV)
+    if prefix and storage != "local":
+        base = prefix.rstrip("/")
+        config["output_result_dir"] = f"{base}/results"
+        config["partial_result_dir"] = f"{base}/partials"
+        config["cache_dir"] = f"{base}/cache"
+    return config
+
+
 def join_path(base: str | os.PathLike[str], *parts: str) -> str:
     """Path-join that works for both local paths and remote URIs.
 

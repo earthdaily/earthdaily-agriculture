@@ -49,7 +49,7 @@ class GreennessExtractor(BaseExtractor):
     Monitors crop canopy development and vegetation vigor through greenness detection.
     Evaluates crop health status based on satellite-derived vegetation indices.
 
-    Documentation: https://docs.earthdaily.com/agro/library/greenness/
+    Documentation: https://docs.earthdaily.com/agro/library/greenness/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_greenness.ipynb
 
     Args (setup_greenness_parameters):

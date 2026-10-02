@@ -61,7 +61,7 @@ class DifferenceExtractor(BaseExtractor):
     between two dates. Returns field-level statistics (max, mean, min) and per-range
     breakdowns with pixel counts and area.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Field%20Level%20Maps/
+    Documentation: https://docs.earthdaily.com/agro/library/Field%20Level%20Maps/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_difference.ipynb
 
     Args (setup_difference_parameters):
@@ -69,7 +69,7 @@ class DifferenceExtractor(BaseExtractor):
         output_epsg (int): Output coordinate system. Default: 4326
         postprocess (str): Processing mode - 'stats', 'links', or 'file'. Default: 'stats'
         map_format (str): Output format for file mode ('png', 'tiff.zip', 'shp.zip'). Default: None
-        output_path (str): Directory for file downloads. Required when postprocess='file'.
+        output_path (str): Directory for file downloads. Default for postprocess='file': <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX.
         directLinks (bool): Request direct download links from API. Default: False
         partial_frequency (int): How often to save partial results. Default: 50
         use_cache (bool): Reuse cached API responses and cache new results to avoid
@@ -132,7 +132,7 @@ class DifferenceExtractor(BaseExtractor):
             output_epsg (int): Output EPSG code for projection. Default: 4326
             postprocess (str): Processing mode - 'stats', 'links', or 'file'. Default: 'stats'
             map_format (str): Output format for file mode ('png', 'tiff.zip', 'shp.zip'). Default: None
-            output_path (str): Directory for file downloads. Required when postprocess='file'.
+            output_path (str): Directory for file downloads. Default for postprocess='file': <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX.
             skip_existing (bool): Skip download if file already exists. Default: True
             directLinks (bool): Request direct download links. Default: False
                 Note: Automatically set to True when postprocess='links'
@@ -184,10 +184,8 @@ class DifferenceExtractor(BaseExtractor):
                 error_msg = "postprocess='file' requires map_format to be set ('png', 'tiff.zip', or 'shp.zip')"
                 log.error(error_msg)
                 raise ValueError(error_msg)
-            if output_path is None:
-                error_msg = "postprocess='file' requires output_path to be set"
-                log.error(error_msg)
-                raise ValueError(error_msg)
+            # Defaults to <results dir>/maps (follows EDAGRO_OUTPUT_PREFIX).
+            output_path = self.resolve_map_output_path(output_path, log)
 
         if column_mapping:
             self.set_column_mapping(column_mapping)
@@ -761,6 +759,7 @@ class DifferenceExtractor(BaseExtractor):
                 bulk_method=self._process_entity_difference_bulk_parallel_inner,
                 entity_list=entity_list,
                 params=self.difference_params,
+                params_kw=params,
                 max_workers=max_workers,
                 output_path=output_path,
                 partial_frequency=partial_frequency,

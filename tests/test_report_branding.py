@@ -7,6 +7,7 @@ Tests for the corporate mark on generated reports (docs/internal/19, §26):
     - a missing asset degrades to a text link rather than failing the report
 """
 
+import html
 from unittest.mock import patch
 
 import pandas as pd
@@ -25,6 +26,10 @@ from earthdaily.agriculture.reporting.extraction_reporter import (
 )
 
 pytestmark = pytest.mark.public
+
+
+# The footer HTML-escapes the URL, so its query string appears with &amp;.
+DOCS_HREF = html.escape(DOCS_URL, quote=True)
 
 
 @pytest.fixture
@@ -100,18 +105,33 @@ class TestPlacement:
 
 class TestFooterLinks:
     def test_footer_links_to_the_documentation(self, report_html):
-        assert DOCS_URL in report_html
-        assert f"href='{DOCS_URL}'" in report_html
+        assert DOCS_HREF in report_html
+        assert f"href='{DOCS_HREF}'" in report_html
 
     def test_docs_link_is_in_the_footer_not_the_hero(self, report_html):
         footer = report_html.split("class='er-footer'", 1)[1]
-        assert DOCS_URL in footer
+        assert DOCS_HREF in footer
         hero = report_html.split("class='er-hero'", 1)[1].split("class='er-footer'", 1)[0]
-        assert DOCS_URL not in hero
+        assert DOCS_HREF not in hero
 
     def test_docs_link_opens_safely(self, report_html):
-        segment = report_html.split(DOCS_URL, 1)[1][:80]
+        segment = report_html.split(DOCS_HREF, 1)[1][:80]
         assert "rel='noopener noreferrer'" in segment
+
+    def test_docs_link_carries_the_package_utm_tags(self):
+        """contributing/11-link-tracking.md: every docs link from this package is tagged."""
+        for tag in (
+            "utm_source=github",
+            "utm_medium=repo",
+            "utm_campaign=earthdaily-agriculture",
+            "utm_content=report-footer",
+        ):
+            assert tag in DOCS_URL
+
+    def test_query_string_is_html_escaped_in_the_href(self, report_html):
+        """A raw ``&`` in an attribute is invalid HTML; the href must carry ``&amp;``."""
+        assert "&amp;utm_medium=repo" in report_html
+        assert "'" + DOCS_URL + "'" not in report_html
 
     def test_terms_and_privacy_are_linked(self, report_html):
         """§26: a surface attributed to EarthDaily says where its terms live."""
@@ -121,13 +141,13 @@ class TestFooterLinks:
 
     def test_footer_link_order_is_useful_then_legal(self, report_html):
         footer = report_html.split("class='er-footer'", 1)[1]
-        positions = [footer.index(url) for _, url in FOOTER_LINKS]
+        positions = [footer.index(html.escape(url, quote=True)) for _, url in FOOTER_LINKS]
         assert positions == sorted(positions), "documentation first, then the legal pair"
 
     def test_every_footer_link_opens_safely(self, report_html):
         footer = report_html.split("class='er-footer'", 1)[1]
         for _, url in FOOTER_LINKS:
-            assert "rel='noopener noreferrer'" in footer.split(url, 1)[1][:80], url
+            assert "rel='noopener noreferrer'" in footer.split(html.escape(url, quote=True), 1)[1][:80], url
 
 
 class TestGracefulDegradation:

@@ -22,6 +22,7 @@ import pandas as pd
 import yaml
 from loguru import logger
 
+from earthdaily.agriculture.core._fs import OUTPUT_PREFIX_ENV, STORAGE_MODES, apply_output_prefix, is_remote_path
 from earthdaily.agriculture.core.functions_enhanced import setup_environment
 from earthdaily.agriculture.core.geometry import load_geodataframe
 
@@ -197,16 +198,20 @@ class WorkflowManager:
                 - ``"local"``: ignore ``EDAGRO_OUTPUT_PREFIX``; force local
                   defaults. Use in dev notebooks when a stray env var would
                   silently route writes to S3.
-                - ``"s3"``: require ``EDAGRO_OUTPUT_PREFIX`` to be set or
-                  explicit ``output_result_dir`` etc. kwargs to be passed.
+                - ``"s3"``: require ``EDAGRO_OUTPUT_PREFIX`` to be a remote URI
+                  (``s3://``, ``az://``, ...) or an explicit remote
+                  ``output_result_dir`` etc. kwarg — a local prefix is rejected.
                   Raises ``ValueError`` otherwise — catches misconfigured
                   S3 runs early instead of silently falling back to local.
 
                 Explicit ``output_result_dir`` / ``partial_result_dir`` /
                 ``cache_dir`` kwargs still win over this flag.
         """
-        # Initialize base configuration first to get project_root
-        self.config = setup_environment(env=env, project_root=project_root)
+        # Initialize base configuration first to get project_root. setup_environment
+        # already routes paths under EDAGRO_OUTPUT_PREFIX for `storage`; the explicit
+        # apply_output_prefix below repeats it (idempotent) so the precedence chain
+        # reads in one place.
+        self.config = setup_environment(env=env, project_root=project_root, storage=storage)
         self.env = self.config["env"]
         self.project_root = self.config["project_root"]
 
@@ -219,29 +224,25 @@ class WorkflowManager:
         #      derive /results, /partials, /cache from it. Cache then
         #      auto-disables because the path is remote (see doc 13 §5).
         #   4. setup_environment defaults — local <project_root>/{results,partials,cache}.
-        if storage not in ("auto", "local", "s3"):
+        if storage not in STORAGE_MODES:
             raise ValueError(f"Invalid storage={storage!r}. Choose from 'auto', 'local', 's3'.")
 
-        output_prefix_env = os.environ.get("EDAGRO_OUTPUT_PREFIX")
+        output_prefix_env = os.environ.get(OUTPUT_PREFIX_ENV)
 
         if storage == "s3":
-            # Require S3 routing — either via env var or via explicit kwargs.
-            has_explicit_remote = any(
-                p is not None and "://" in p for p in (output_result_dir, partial_result_dir, cache_dir)
-            )
-            if not output_prefix_env and not has_explicit_remote:
+            # Require S3 routing — either a REMOTE env prefix or an explicit remote kwarg.
+            # A local EDAGRO_OUTPUT_PREFIX used to satisfy this, so a container meant to
+            # write to S3 could run to completion against its own ephemeral disk.
+            has_explicit_remote = any(is_remote_path(p) for p in (output_result_dir, partial_result_dir, cache_dir))
+            if not is_remote_path(output_prefix_env) and not has_explicit_remote:
                 raise ValueError(
-                    "storage='s3' requires EDAGRO_OUTPUT_PREFIX to be set, or at "
-                    "least one of output_result_dir / partial_result_dir / cache_dir "
-                    "to be a remote URI (s3://, gs://, ...). Got neither."
+                    "storage='s3' requires EDAGRO_OUTPUT_PREFIX to be a remote URI (s3://, az://, ...), "
+                    "or at least one of output_result_dir / partial_result_dir / cache_dir to be one. "
+                    f"Got EDAGRO_OUTPUT_PREFIX={output_prefix_env!r}."
                 )
 
         # Apply the env-var prefix unless storage='local' explicitly opts out.
-        if output_prefix_env and storage != "local":
-            prefix = output_prefix_env.rstrip("/")
-            self.config["output_result_dir"] = f"{prefix}/results"
-            self.config["partial_result_dir"] = f"{prefix}/partials"
-            self.config["cache_dir"] = f"{prefix}/cache"
+        apply_output_prefix(self.config, storage)
 
         if output_result_dir is not None:
             self.config["output_result_dir"] = output_result_dir

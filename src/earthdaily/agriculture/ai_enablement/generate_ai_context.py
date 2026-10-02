@@ -136,6 +136,18 @@ COMMON_SETUP_PARAMS = {
 # ---------------------------------------------------------------------------
 
 
+def strip_link_tracking(url: str) -> str:
+    """Drop the UTM query from a docs link, leaving the canonical page URL.
+
+    Docstring links carry the package's UTM tags (earthdaily-documentation-WIP
+    ``contributing/11-link-tracking.md``) so GA4 credits clicks from a user's IDE,
+    scaffolded project or skill. This repo's OWN CLAUDE.md / agents.md use the clean
+    URL: the team's clicks are not package traffic, and the gap analysis compares
+    page paths, which a query string would hide.
+    """
+    return url.split("?", 1)[0]
+
+
 def parse_docstring(docstring: str) -> dict:
     """Parse a structured class docstring into a metadata dict."""
     if not docstring:
@@ -171,7 +183,8 @@ def parse_docstring(docstring: str) -> dict:
     # Documentation URL
     match = re.search(r"Documentation:\s*(https?://\S+)", full_text)
     if match:
-        result["documentation_url"] = match.group(1)
+        result["documentation_link"] = match.group(1)  # as written: with UTM tags
+        result["documentation_url"] = strip_link_tracking(match.group(1))  # canonical page
         result["raw_sections_found"].append("Documentation:")
 
     # Notebook
@@ -370,6 +383,7 @@ def introspect_class(module_path: str, class_name: str, category: str) -> dict:
         "inherits": bases,
         "description": parsed.get("description", ""),
         "documentation_url": parsed.get("documentation_url"),
+        "documentation_link": parsed.get("documentation_link"),
         "notebook": parsed.get("notebook"),
         "setup_method": get_setup_method(cls),
         "setup_args_from_docstring": parsed.get("setup_args", []),
@@ -907,8 +921,13 @@ def generate_claude_md(entries: list) -> str:
 # ---------------------------------------------------------------------------
 
 
-def generate_agents_md(entries: list) -> str:
-    """Generate agents.md with per-extractor agent cards for AI assistants."""
+def generate_agents_md(entries: list, tracked_links: bool = False) -> str:
+    """Generate agents.md with per-extractor agent cards for AI assistants.
+
+    ``tracked_links`` keeps the docstring's UTM-tagged docs links — for output that lands
+    in someone else's environment (a scaffolded project, the personal skill). The repo's
+    own agents.md uses the canonical URL; see :func:`strip_link_tracking`.
+    """
     lines = []
     lines.append("# agents.md — EarthDaily Agriculture Extractor Agent Cards")
     lines.append("")
@@ -942,7 +961,8 @@ def generate_agents_md(entries: list) -> str:
         if entry.get("source_file"):
             lines.append(f"**Source:** `{entry['source_file']}`  ")
         if entry.get("documentation_url"):
-            lines.append(f"**API Docs:** {entry['documentation_url']}  ")
+            docs = entry.get("documentation_link") if tracked_links else None
+            lines.append(f"**API Docs:** {docs or entry['documentation_url']}  ")
         if entry.get("notebook"):
             lines.append(f"**Notebook:** `{entry['notebook']}`  ")
         lines.append("")
@@ -1097,10 +1117,10 @@ export EDAGRO_OUTPUT_PREFIX=s3://my-bucket/runs/2026-01-01/<workflow>   # or az:
 export EDAGRO_LOG_CONSOLE_ONLY=1
 ```
 
-- `EDAGRO_OUTPUT_PREFIX` — routes writers under `{{prefix}}/results`, `{{prefix}}/partials`, `{{prefix}}/cache` automatically. Precedence: explicit kwargs > env var > local defaults.
+- `EDAGRO_OUTPUT_PREFIX` — routes writers under `{{prefix}}/results`, `{{prefix}}/partials`, `{{prefix}}/cache` automatically, in `WorkflowManager`, `setup_environment()` and directly-built extractors alike (`core._fs.apply_output_prefix`). Precedence: explicit kwargs / config paths > env var > local defaults.
 - `EDAGRO_LOG_CONSOLE_ONLY=1` — skip the loguru file sink, emit logs only to stdout (so the orchestrator captures them the standard way).
 
-Equivalent code kwargs: `WorkflowManager(..., output_result_dir=..., partial_result_dir=..., cache_dir=..., log_to_console_only=True)`. The env vars win if both are set.
+Equivalent code kwargs: `WorkflowManager(..., output_result_dir=..., partial_result_dir=..., cache_dir=..., log_to_console_only=True)`. Explicit path kwargs win over `EDAGRO_OUTPUT_PREFIX`; for console-only logging, either the kwarg or `EDAGRO_LOG_CONSOLE_ONLY=1` turns it on.
 
 See `docs/14 - Deployment_patterns.md` for the full Pattern A (GH Actions cron) vs Pattern B (Docker container) decision guide.
 
@@ -1701,6 +1721,8 @@ def main():
     # Generate outputs
     claude_md = generate_claude_md(entries)
     agents_md = generate_agents_md(entries)
+    # extractors.md written into a project / personal skill keeps the UTM-tagged links.
+    agents_md_tracked = generate_agents_md(entries, tracked_links=True)
     gap_report = format_gap_report(gaps, entries)
 
     # ── Personal-skill mode: write a global skill into ~/.claude/skills/earthdaily-agriculture ──
@@ -1724,7 +1746,7 @@ def main():
                 runbook_pointers=render_runbook_pointers(script_root, runbooks_copied),
             )
             (target / "SKILL.md").write_text(personal_skill_md, encoding="utf-8")
-            (target / "extractors.md").write_text(agents_md, encoding="utf-8")
+            (target / "extractors.md").write_text(agents_md_tracked, encoding="utf-8")
 
         if args.check:
             if runbook_drift:
@@ -1763,7 +1785,7 @@ def main():
 
         (target / "CLAUDE.md").write_text(project_claude, encoding="utf-8")
         (skill_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
-        (skill_dir / "extractors.md").write_text(agents_md, encoding="utf-8")
+        (skill_dir / "extractors.md").write_text(agents_md_tracked, encoding="utf-8")
 
         errors = sum(1 for e in entries if "error" in e)
         print(f"\nProject context generated in {target}:")

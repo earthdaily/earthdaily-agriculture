@@ -5,6 +5,8 @@ Tests for FLMExtractor validation logic:
     - require_flm_params decorator
 """
 
+import os
+
 import pytest
 
 pytestmark = pytest.mark.public
@@ -196,7 +198,13 @@ class TestSetupFlmParametersFileMode:
         with pytest.raises(ValueError, match="map_format"):
             flm_extractor.setup_flm_parameters(postprocess="file", output_path="/tmp/out")
 
-    def test_file_mode_requires_output_path(self, flm_extractor):
+    def test_file_mode_defaults_to_results_maps(self, flm_extractor):
+        """No output_path -> <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX."""
+        flm_extractor.setup_flm_parameters(postprocess="file", map_format="png")
+        assert flm_extractor.flm_params["output_path"] == os.path.join(flm_extractor.output_path, "maps")
+
+    def test_file_mode_without_any_path_still_raises(self, flm_extractor):
+        flm_extractor.output_path = None
         with pytest.raises(ValueError, match="output_path"):
             flm_extractor.setup_flm_parameters(postprocess="file", map_format="png")
 

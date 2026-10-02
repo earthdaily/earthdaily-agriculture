@@ -47,7 +47,7 @@ class PlantedExtractor(BaseExtractor):
     Estimates planted acreage using crop identification and emergence data.
     Validates planting status and computes planted area percentages.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Planted_Area/
+    Documentation: https://docs.earthdaily.com/agro/library/Planted_Area/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_coverage.ipynb
 
     Args (setup_planted_parameters):
@@ -546,6 +546,7 @@ class PlantedExtractor(BaseExtractor):
                 bulk_method=self._process_planted_bulk_extraction_parallel_inner,
                 entity_list=entity_list,
                 params=self.planted_params,
+                params_kw=params,
                 max_workers=max_workers,
                 output_path=output_path,
                 partial_frequency=partial_frequency,

@@ -10,6 +10,8 @@ from dotenv import find_dotenv, load_dotenv
 from loguru import logger
 from tqdm import tqdm
 
+from earthdaily.agriculture.core._fs import apply_output_prefix
+
 # Import necessary functions from api_utils
 
 # from earthdaily.agriculture.extractors.coverage_function import CoverageExtractor
@@ -471,13 +473,17 @@ def _resolve_project_root():
     return str(cwd)
 
 
-def setup_environment(env: str = None, project_root: str = None):
+def setup_environment(env: str = None, project_root: str = None, storage: str = "auto"):
     """Setup environment with logging.
 
     Args:
         env: Environment override ('prod' or 'preprod'). If None, reads from ENVIRONMENT env var.
         project_root: Override for workspace root (where results/, partials/, etc. are created).
             If None, resolves automatically via pyproject.toml lookup.
+        storage: ``"auto"`` (default) routes results / partials / cache under
+            ``EDAGRO_OUTPUT_PREFIX`` when it is set; ``"local"`` ignores it. This is
+            what makes the variable work for an extractor built directly from this
+            config, with no WorkflowManager (e.g. a stateless container).
     """
     # Resolve the code project root (where pyproject.toml / src/.env live)
     code_root = _resolve_project_root()
@@ -596,7 +602,9 @@ def setup_environment(env: str = None, project_root: str = None):
         if alias:
             config[alias] = folder_path
 
-    return config
+    # The local folders above still exist (logs/ and inputs/ are always local); the
+    # prefix only re-points the three writer paths.
+    return apply_output_prefix(config, storage)
 
 
 # def setup_environment():

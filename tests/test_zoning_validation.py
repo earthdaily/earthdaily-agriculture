@@ -4,6 +4,8 @@ Tests for ZoningExtractor validation logic:
     - require_zoning_params decorator
 """
 
+import os
+
 import pytest
 
 pytestmark = pytest.mark.public
@@ -155,7 +157,13 @@ class TestSetupZoningParameters:
         with pytest.raises(ValueError, match="map_format"):
             zoning_extractor.setup_zoning_parameters(postprocess="file", map_format=None, output_path="/tmp")
 
-    def test_postprocess_file_requires_output_path(self, zoning_extractor):
+    def test_postprocess_file_defaults_to_results_maps(self, zoning_extractor):
+        """No output_path -> <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX."""
+        zoning_extractor.setup_zoning_parameters(postprocess="file", map_format="png", output_path=None)
+        assert zoning_extractor.zoning_params["output_path"] == os.path.join(zoning_extractor.output_path, "maps")
+
+    def test_postprocess_file_without_any_path_still_raises(self, zoning_extractor):
+        zoning_extractor.output_path = None
         with pytest.raises(ValueError, match="output_path"):
             zoning_extractor.setup_zoning_parameters(postprocess="file", map_format="png", output_path=None)
 

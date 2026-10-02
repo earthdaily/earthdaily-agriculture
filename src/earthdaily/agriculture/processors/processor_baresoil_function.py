@@ -44,7 +44,7 @@ class BaresoilExtractor(BaseExtractor):
     Estimates the number of days with bare soil exposed during a season using satellite
     imagery analysis. Supports summary and detailed output modes.
 
-    Documentation: https://docs.earthdaily.com/agro/library/baresoil/
+    Documentation: https://docs.earthdaily.com/agro/library/baresoil/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_baresoil.ipynb
 
     Args (setup_baresoil_parameters):

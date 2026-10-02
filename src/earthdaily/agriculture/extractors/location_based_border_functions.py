@@ -508,6 +508,7 @@ class LocationBasedBorderExtractor(BaseExtractor):
                 bulk_method=self._process_location_based_border_bulk_extraction_parallel_inner,
                 entity_list=entity_list,
                 params=self.location_based_border_params,
+                params_kw=params,
                 max_workers=max_workers,
                 output_path=output_path,
                 partial_frequency=partial_frequency,

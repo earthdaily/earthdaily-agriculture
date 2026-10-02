@@ -113,7 +113,7 @@ class HistoricalScoreExtractor(BaseExtractor):
     index patterns across multiple years. Supports configurable season windows, historical
     season comparison, and multiple detail levels.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Historical_Potential_Score/
+    Documentation: https://docs.earthdaily.com/agro/library/Historical_Potential_Score/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_historical_score.ipynb
 
     Args (setup_historical_score_parameters):
@@ -847,7 +847,7 @@ class InseasonScoreExtractor(BaseExtractor):
     Computes current-season risk assessment using predictive analytics based on vegetation
     index trends. Provides real-time scoring and comparison with historical baselines.
 
-    Documentation: https://docs.earthdaily.com/agro/library/In-season_Potential_Score/
+    Documentation: https://docs.earthdaily.com/agro/library/In-season_Potential_Score/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_inseason_score.ipynb
 
     Args (setup_inseason_score_parameters):

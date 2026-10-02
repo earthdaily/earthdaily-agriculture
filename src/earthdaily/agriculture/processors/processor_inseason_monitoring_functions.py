@@ -48,7 +48,7 @@ class InSeasonMonitoringExtractor(BaseExtractor):
     Combines satellite and weather data for real-time crop performance monitoring.
     Runs against either resolution (LR or MR) with configurable season windows.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/
+    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_InSeasonMonitoring.ipynb
 
     Args (setup_inseason_monitoring_parameters):
@@ -482,6 +482,7 @@ class InSeasonMonitoringExtractor(BaseExtractor):
                 bulk_method=self._process_inseason_bulk_extraction_parallel_inner,
                 entity_list=entity_list,
                 params=self.inseason_monitoring_params,
+                params_kw=params,
                 max_workers=max_workers,
                 output_path=output_path,
                 partial_frequency=partial_frequency,

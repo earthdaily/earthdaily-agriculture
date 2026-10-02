@@ -95,7 +95,7 @@ The `earthdaily-agriculture` Python package provides a ready-to-use library that
 * **Cloud-friendly output.** Route results, partials, and logs to S3 or Azure Storage (or any S3-compatible store) via `EDAGRO_OUTPUT_PREFIX` or constructor kwargs.
 * **Entity & user management.** `EntityManager` and `UserManager` cover the EarthDaily Agriculture MDM API (Farm / Field / Seasonfield, growers, agronomists, account linking).
 
-See the [documentation](https://docs.earthdaily.com/agro/) and the notebooks under [`notebooks/`](https://github.com/earthdaily/earthdaily-agriculture/tree/main/notebooks) for working examples.
+See the [documentation](https://docs.earthdaily.com/agro/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=readme) and the notebooks under [`notebooks/`](https://github.com/earthdaily/earthdaily-agriculture/tree/main/notebooks) for working examples.
 
 <p align="right">(<a href="#top">back to top</a>)</p>
 
@@ -232,7 +232,7 @@ See the Jupyter notebooks under [`notebooks/`](https://github.com/earthdaily/ear
 
 ## Documentation
 
-Full documentation lives at <https://docs.earthdaily.com/agro/>.
+Full documentation lives at [docs.earthdaily.com/agro](https://docs.earthdaily.com/agro/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=readme).
 
 Pages you'll likely want first:
 
@@ -251,7 +251,7 @@ Pages you'll likely want first:
 ## Resources
 The following links provide more information:
 - [Pypi package](https://pypi.org/project/earthdaily-agriculture/)
-- [Documentation](https://docs.earthdaily.com/agro/)
+- [Documentation](https://docs.earthdaily.com/agro/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=readme)
 
 <p align="right">(<a href="#top">back to top</a>)</p>
 

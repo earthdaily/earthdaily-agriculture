@@ -31,7 +31,7 @@ from earthdaily.agriculture.services.entity_management import get_seasonfield_li
 # were exported via different paths).
 api_get_seasonfield_list = get_seasonfield_list
 
-__version__ = "2.6.0"
+__version__ = "2.6.1"
 __author__ = "EarthDaily Agriculture KA Team"
 __description__ = "Utilities for analytics bulk extraction, weather data, change index and In season Monitoring from EarthDaily Agriculture API"
 

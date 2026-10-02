@@ -6,7 +6,7 @@
     "author": "EarthDaily Agriculture",
     "environment": "prod",
     "python_version": "3.12",
-    "edagro_wheel_version": "2.6.0",
+    "edagro_wheel_version": "2.6.1",
     "edagro_install_mode": [
         "pypi",
         "wheel"

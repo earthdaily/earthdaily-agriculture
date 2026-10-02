@@ -47,7 +47,7 @@ class DiseaseExtractor(BaseExtractor):
     parameter values (e.g., infection risk, sporulation, severity) for supported crops
     (corn, soybeans).
 
-    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/
+    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_disease.ipynb
 
     Args (setup_disease_parameters):
@@ -588,6 +588,7 @@ class DiseaseExtractor(BaseExtractor):
                 bulk_method=self._process_entity_disease_bulk_parallel_inner,
                 entity_list=entity_list,
                 params=self.disease_params,
+                params_kw=params,
                 max_workers=max_workers,
                 output_path=output_path,
                 partial_frequency=partial_frequency,

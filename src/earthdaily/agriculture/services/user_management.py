@@ -55,7 +55,7 @@ class UserManager(BaseExtractor):
     account linking, modification, and deletion. All batch operations use
     parallel processing for performance.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/
+    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
 
     Supported operations:
         - User creation (AGRONOMIST/GROWER) with automatic ordering
@@ -638,6 +638,7 @@ class UserManager(BaseExtractor):
                 bulk_method=self._process_entity_user_bulk_parallel_inner,
                 entity_list=entity_list,
                 params=self.user_params,
+                params_kw=params,
                 max_workers=max_workers,
                 output_path=output_path,
                 partial_frequency=partial_frequency,

@@ -47,7 +47,7 @@ class FLMExtractor(BaseExtractor):
     Supports map statistics extraction, direct download links, and raster file export with
     configurable clipping and buffering.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Field%20Level%20Maps/
+    Documentation: https://docs.earthdaily.com/agro/library/Field%20Level%20Maps/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_FLM_extraction_functions.ipynb
 
     Args (setup_flm_parameters):
@@ -125,7 +125,7 @@ class FLMExtractor(BaseExtractor):
             skip_existing (bool): With postprocess='file', skip the API call when the output
                 file for an entity/image is already in output_path (non-empty). Lets a crashed
                 bulk run resume without re-downloading. Default: True
-            output_path (str): Path to save downloaded maps
+            output_path (str): Path to save downloaded maps. Default for postprocess='file': <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX.
             extract_stats (bool): If True, extract statistics only (no file download)
             partial_frequency (int): How often to save partial results
             directLinks (bool): Whether to use direct links in API response. Default: False
@@ -242,10 +242,9 @@ class FLMExtractor(BaseExtractor):
                 log.error(error_msg)
                 raise ValueError(error_msg)
 
-            if output_path is None:
-                error_msg = "postprocess='file' requires output_path to be set"
-                log.error(error_msg)
-                raise ValueError(error_msg)
+            # Defaults to <results dir>/maps (follows EDAGRO_OUTPUT_PREFIX); raises only
+            # when there is no results directory either.
+            output_path = self.resolve_map_output_path(output_path, log)
 
             log.debug(f"Validated postprocess='file' requirements: map_format={map_format}, output_path={output_path}")
 
@@ -972,6 +971,7 @@ class FLMExtractor(BaseExtractor):
                 bulk_method=self._process_entity_flm_bulk_parallel_inner,
                 entity_list=entity_list,
                 params=self.flm_params,
+                params_kw=params,
                 max_workers=max_workers,
                 output_path=output_path,
                 partial_frequency=partial_frequency,

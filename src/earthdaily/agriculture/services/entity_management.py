@@ -214,7 +214,7 @@ class EntityManager(BaseExtractor):
     (Farm > Field > Seasonfield). Supports bulk entity loading, batch processing,
     and integration with UserManager for Grower ID resolution.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/
+    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_entity_management.ipynb
 
     Supported operations:

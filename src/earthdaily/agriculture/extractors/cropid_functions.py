@@ -48,7 +48,7 @@ class cropidExtractor(BaseExtractor):
     end-of-season and in-season mask types, historical crop rotation analysis, and
     configurable confidence thresholds.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/
+    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_cropid.ipynb
 
     Args (setup_cropid_parameters):

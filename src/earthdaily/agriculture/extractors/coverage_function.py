@@ -61,7 +61,7 @@ class CoverageExtractor(BaseExtractor):
     for a given geometry and date range. Supports duplicate filtering across sensors and
     multi-sensor coverage analysis.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/
+    Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_coverage.ipynb
 
     Args (setup_coverage_parameters):

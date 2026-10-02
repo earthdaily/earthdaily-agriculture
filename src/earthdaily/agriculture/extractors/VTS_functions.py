@@ -62,7 +62,7 @@ class VegationTsExtractor(BaseExtractor):
     at field level. Supports period-based and target-date extraction modes, KPI aggregation,
     and multi-year historical comparison.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Vegetation_time_series/
+    Documentation: https://docs.earthdaily.com/agro/library/Vegetation_time_series/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_VTS.ipynb
 
     Args (setup_vegetation_ts_parameters):
@@ -1240,7 +1240,7 @@ class MRTSExtractor(BaseExtractor):
     Supports raw and smoothed data extraction, temporal consistency checks, denoising,
     and end-of-curve extrapolation. Works with Sentinel-2, Landsat-8/9, and other sensors.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Vegetation_time_series/
+    Documentation: https://docs.earthdaily.com/agro/library/Vegetation_time_series/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_MRTS_extraction_functions.ipynb
 
     Args (setup_mrts_parameters):

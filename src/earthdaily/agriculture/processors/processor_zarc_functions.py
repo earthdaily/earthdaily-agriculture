@@ -45,7 +45,7 @@ class ZARCExtractor(BaseExtractor):
     Brazilian Agricultural Climate Risk Zoning compliance service. Validates crop cycle
     parameters against ZARC risk zones and computes soil water balance metrics.
 
-    Documentation: https://docs.earthdaily.com/agro/library/ZARC/
+    Documentation: https://docs.earthdaily.com/agro/library/ZARC/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_ZARC.ipynb
 
     Args (setup_zarc_parameters):
@@ -53,10 +53,11 @@ class ZARCExtractor(BaseExtractor):
         nb_days_sowing_emergence (int): Days between sowing and emergence. Default: 20
         soil_type (str): Soil type classification. Default: None
         cycle (str): Crop cycle duration. Default: None
+        emergence_date (str): Run-wide emergence date (YYYY-MM-DD), used for any row without its own. Default: None
         use_cache (bool): Reuse cached API responses and cache new results to avoid re-fetching. None uses the extractor's instance default. Default: None
 
     Entity fields (via column_mapping):
-        id, geometry (required); crop, sowing_date (optional)
+        id, geometry (required); emergence_date (required per row, unless set in setup or run params — YYYY-MM-DD); crop, soil_type, cycle, nb_days_sowing_emergence (optional per-row overrides)
 
     Output columns:
         entity_id, crop, risk_level, sowing_date, emergence_date, + soil water balance metrics
@@ -80,6 +81,7 @@ class ZARCExtractor(BaseExtractor):
         exclude_columns=None,
         output_columns=None,
         use_cache=None,
+        emergence_date: Optional[str] = None,
     ) -> None:
         """
         Configure ZARC global parameters that apply to all entities.
@@ -90,6 +92,8 @@ class ZARCExtractor(BaseExtractor):
             soil_type: Optional default soil type
             cycle: Optional default crop cycle
             partial_frequency: How often to save partial results during bulk processing
+            emergence_date: Optional run-wide emergence date (YYYY-MM-DD) for rows that
+                carry none. A per-row ``emergence_date`` always wins.
         """
         log = self.get_contextualized_logger("SETUP")  # ✅ Initialize logger
         log.info("Configuring ZARC parameters...")
@@ -111,6 +115,17 @@ class ZARCExtractor(BaseExtractor):
             "cycle": cycle,
             "partial_frequency": partial_frequency,
         }
+        # Only stored when set: zarc_params is the cache key, so adding a None entry
+        # would invalidate every existing cache for runs that never use the option.
+        # normalize_date accepts ISO timestamps the same way per-row dates do; strptime
+        # is the validation (safe_parse_date returns unrecognised strings unchanged).
+        if emergence_date:
+            parsed = self.normalize_date(emergence_date)
+            try:
+                datetime.strptime(str(parsed), "%Y-%m-%d")
+            except ValueError:
+                raise ValueError(f"emergence_date must be a YYYY-MM-DD date, got {emergence_date!r}") from None
+            self.zarc_params["emergence_date"] = parsed
 
         id_col = self.get_mapped_column("id")
         self.cache_key_columns = [id_col]
@@ -203,12 +218,19 @@ class ZARCExtractor(BaseExtractor):
             log.error(f"❌ Invalid geometry for entity {entity_id}: {e}")
             raise
 
-        # Priority: entity_data values > setup_zarc_parameters defaults
-        # This allows per-entity overrides while using global defaults as fallback
-        crop = self.get_entity_value(entity_data, "crop", params["crop"])
-        soil_type = self.get_entity_value(entity_data, "soil_type", params.get("soil_type"))
-        cycle = self.get_entity_value(entity_data, "cycle", params.get("cycle"))
-        nb_days = self.get_entity_value(entity_data, "nb_days_sowing_emergence", params["nb_days_sowing_emergence"])
+        # Priority: entity_data values > setup_zarc_parameters defaults.
+        # A key that is present but empty must fall back too: get_entity_value only
+        # returns its default for a MISSING key, and process_single_entity_zarc always
+        # sets these keys — so a row without a crop sent `crop=None` to the API and the
+        # setup default never applied.
+        def _value_or(key, fallback):
+            value = self.get_entity_value(entity_data, key)
+            return fallback if value is None or value == "" else value
+
+        crop = _value_or("crop", params["crop"])
+        soil_type = _value_or("soil_type", params.get("soil_type"))
+        cycle = _value_or("cycle", params.get("cycle"))
+        nb_days = _value_or("nb_days_sowing_emergence", params["nb_days_sowing_emergence"])
 
         log.debug(
             f"Entity {entity_id} - Crop: {crop}, Emergence: {emergence_date}, Days: {nb_days}, Soil: {soil_type}, Cycle: {cycle}"
@@ -391,8 +413,11 @@ class ZARCExtractor(BaseExtractor):
             return {"data": None, "error": {"message": error_msg, "entity_id": entity_id}}
 
         # Get nb_days_sowing_emergence from row or fallback to params
+        # A blank CSV cell arrives as "" and must fall back like None — otherwise it
+        # reached get_zarc_api, which only knows the setup default, and a run-level
+        # override was silently replaced by it.
         nb_days = self.get_entity_value(row, "nb_days_sowing_emergence")
-        if nb_days is None and params:
+        if (nb_days is None or nb_days == "") and params:
             nb_days = params.get("nb_days_sowing_emergence")
 
         if nb_days is None:
@@ -402,18 +427,25 @@ class ZARCExtractor(BaseExtractor):
 
         log.debug(f"Entity {entity_id}: emergence_date={emergence_date}, nb_days={nb_days}")
 
+        # Row value, else the run's params. get_zarc_api only knows the setup
+        # defaults, so a run-level override (workflow `run.params.params`) has to be
+        # resolved here or it never reaches the request.
+        def _row_or_params(key):
+            value = self.get_entity_value(row, key)
+            if (value is None or value == "") and params:
+                value = params.get(key)
+            return value
+
         # Prepare entity_data for API call
         entity_data = {
             self.get_mapped_column("id"): entity_id,
             self.get_mapped_column("geometry"): geometry,
             "emergence_date": emergence_date,
-            self.get_mapped_column("crop"): self.get_entity_value(
-                row, "crop"
-            ),  # Will fallback to params in get_zarc_api
             # get_entity_value already handles dict vs Series — the isinstance dance
             # here was hand-rolling it, and skipped column_mapping while doing so.
-            "soil_type": self.get_entity_value(row, "soil_type"),
-            "cycle": self.get_entity_value(row, "cycle"),
+            self.get_mapped_column("crop"): _row_or_params("crop"),
+            "soil_type": _row_or_params("soil_type"),
+            "cycle": _row_or_params("cycle"),
             "nb_days_sowing_emergence": nb_days,
         }
 
@@ -479,12 +511,14 @@ class ZARCExtractor(BaseExtractor):
         generate_report: bool = False,
         report_options: Optional[Dict[str, Any]] = None,
         use_cache=None,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Bulk processing for ZARC with parallel execution, filtering, and export capabilities.
 
         Args:
-            entity_list: DataFrame with entities to process (must contain 'id', 'geometry', 'emergence_date')
+            entity_list: DataFrame with entities to process (must contain 'id', 'geometry', and
+                'emergence_date' unless one is set in setup or ``params``)
             max_workers: Number of parallel threads
             output_path: Directory to save final CSV results
             partial_frequency: How often to save partial results
@@ -496,6 +530,11 @@ class ZARCExtractor(BaseExtractor):
             skip_export: If True, skip final export (useful when chaining extractions)
             prefix: Prefix for output filenames and failed IDs files
             use_cache: If True, use caching for bulk extraction. Default: None (uses instance setting).
+            params: Optional run-level overrides merged over ``setup_zarc_parameters`` — any of
+                ``crop``, ``nb_days_sowing_emergence``, ``soil_type``, ``cycle``,
+                ``emergence_date``. Per-row values still win. This is also the argument
+                WorkflowManager always passes; without it a ZARC workflow step raised
+                ``TypeError``.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics
@@ -504,7 +543,10 @@ class ZARCExtractor(BaseExtractor):
             return self._bulk_with_cache(
                 bulk_method=self._process_zarc_bulk_extraction_parallel_inner,
                 entity_list=entity_list,
+                # Setup params only: _bulk_with_cache folds params_kw (the run-level
+                # overrides) into the key itself, for every extractor.
                 params=self.zarc_params,
+                params_kw=params,
                 max_workers=max_workers,
                 output_path=output_path,
                 partial_frequency=partial_frequency,
@@ -520,6 +562,7 @@ class ZARCExtractor(BaseExtractor):
             )
         return self._process_zarc_bulk_extraction_parallel_inner(
             entity_list=entity_list,
+            params_kw=params,
             max_workers=max_workers,
             output_path=output_path,
             partial_frequency=partial_frequency,
@@ -554,6 +597,10 @@ class ZARCExtractor(BaseExtractor):
         report_options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Inner implementation of process_zarc_bulk_extraction_parallel."""
+        # Run-level overrides on top of the setup defaults. None keeps the historical
+        # path exactly: process_single_entity_zarc falls back to self.zarc_params and
+        # the per-entity cache key is unchanged.
+        params = {**(self.zarc_params or {}), **params_kw} if params_kw else None
         log = self.get_contextualized_logger("BULK_EXTRACTION")
         log.info("=" * 60)
         log.info(f"Starting bulk ZARC extraction: {prefix}")
@@ -608,7 +655,9 @@ class ZARCExtractor(BaseExtractor):
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_zarc, row.to_dict()): self.get_entity_value(row, "id")
+                executor.submit(self.process_single_entity_zarc, row.to_dict(), params): self.get_entity_value(
+                    row, "id"
+                )
                 for _, row in filtered_entity_list.iterrows()
             }
 
@@ -711,7 +760,7 @@ class ZARCExtractor(BaseExtractor):
                 "successful": successful_calculations,
                 "failed": total_calculations - successful_calculations,
                 "elapsed_seconds": elapsed_time,
-                "parameters": getattr(self, "zarc_params", {}),
+                "parameters": params or getattr(self, "zarc_params", {}),
                 "entity_df": entity_list,
             },
         )

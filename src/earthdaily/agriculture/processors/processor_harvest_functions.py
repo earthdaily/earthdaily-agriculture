@@ -50,7 +50,7 @@ class HarvestExtractor(BaseExtractor):
     Identifies harvest dates and monitors harvest progress using satellite-based temporal
     analysis. Supports in-season, historical and harvest-readiness detection.
 
-    Documentation: https://docs.earthdaily.com/agro/library/Harvest_Detection/
+    Documentation: https://docs.earthdaily.com/agro/library/Harvest_Detection/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_harvest.ipynb
 
     Args (setup_harvest_parameters):

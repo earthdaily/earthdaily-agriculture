@@ -354,7 +354,7 @@ docker run --rm \
   run-extractor --extractor CoverageExtractor --setup '{"start_date":"2025-01-01"}'
 ```
 
-`WorkflowManager` reads `EDAGRO_OUTPUT_PREFIX` at construction time and sets:
+`EDAGRO_OUTPUT_PREFIX` is read at construction time — by `WorkflowManager`, by `setup_environment()`, and by any extractor whose config does not set the paths itself (an extractor called directly in a stateless container) — and sets:
 
 - `output_result_dir = <prefix>/results`
 - `partial_result_dir = <prefix>/partials`
@@ -362,7 +362,7 @@ docker run --rm \
 
 Constructor kwargs take precedence if you pass them explicitly, so the env var is a default that orchestrators set and `docker run --rm -e EDAGRO_OUTPUT_PREFIX=…` becomes the canonical invocation.
 
-For notebooks that need an explicit assertion rather than relying on the env var (typical when a developer's `.env` might shadow the orchestrator setting), pass `storage="s3"` to `WorkflowManager` — it raises if neither `EDAGRO_OUTPUT_PREFIX` nor an explicit remote kwarg is supplied. See [`13 - Cloud_storage_principles_and_usage.md`](13%20-%20Cloud_storage_principles_and_usage.md) Recipe B.
+For notebooks that need an explicit assertion rather than relying on the env var (typical when a developer's `.env` might shadow the orchestrator setting), pass `storage="s3"` to `WorkflowManager` — it raises unless `EDAGRO_OUTPUT_PREFIX` is a remote URI (`s3://`, `az://`, …) or an explicit remote kwarg is supplied. A local prefix is rejected too: it would let a container meant for S3 write to its own ephemeral disk. See [`13 - Cloud_storage_principles_and_usage.md`](13%20-%20Cloud_storage_principles_and_usage.md) Recipe B.
 
 `EDAGRO_LOG_CONSOLE_ONLY=1` skips the loguru file sink so the container's stdout is the log stream.
 
