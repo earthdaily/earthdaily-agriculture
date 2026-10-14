@@ -5,7 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
-from typing import Union
+from typing import Literal, Union
 
 import numpy as np
 import pandas as pd
@@ -24,7 +24,27 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import RegionalBulkResult
+
+# Allowed values: one list each, read by the validator (BaseExtractor._check_choice)
+# and by generate_ai_context. Declared here, never repeated in a docstring.
+RegionalIndex = Literal[
+    "vegetation-vigor-index",
+    "daily-precipitation",
+    "soil-moisture",
+    "min-temperature",
+    "max-temperature",
+    "average-temperature",
+    "surface-temperature",
+    "etp",
+    "max-wind-speed",
+    "p-etp",
+    "relative-humidity",
+    "snow-depth",
+    "solar-radiation",
+]
 
 
 def require_regional_params(func):
@@ -51,14 +71,17 @@ class RegionalExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Regional_Monitoring/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_VTS.ipynb
+    OpenAPI: https://api.geosys-na.net/Agriquest/Geosys.AgriQuest.CropMonitoring.WebApi/v0/swagger/v0/swagger.json
+    Operation: POST /api/{index}
 
     Args (setup_regional_parameters):
-        index (str): Regional index type. Default: 'vegetation-vigor-index'
+        index (RegionalIndex): Regional index of the series. Default: 'vegetation-vigor-index'
         start_date (str): Start date in YYYY-MM-DD format. Default: '2025-01-01'
         end_date (str): End date in YYYY-MM-DD format. Default: None (last day of current year)
         fillyeargap (bool): Fill year gaps in data. Default: False
-        idblock (str): Block identifier. Default: None
-        idpixeltype (str): Pixel type identifier. Default: None
+        idblock (int): AgriQuest block id. A catalog value: checked against a list kept in the
+            code, not declared as a Literal; the blocks are in the Regional Monitoring docs. Default: None
+        idpixeltype (int): AgriQuest pixel type id. A catalog value, checked like idblock. Default: None
         indicatorTypeIds (list): Indicator type IDs — accepted values are 1-5 only
             (1 VVI, 2/3 weather observed, 4/5 weather forecast). Default: None
             (auto-set to [1] when index='vegetation-vigor-index')
@@ -68,7 +91,7 @@ class RegionalExtractor(BaseExtractor):
         amu_id (required — regional AMU entity ID)
 
     Output columns:
-        entity_id, date, year, regional index values
+        date, month, day, day_of_year, indicator_type_id, value (per AMU of the input)
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -93,7 +116,7 @@ class RegionalExtractor(BaseExtractor):
 
     def setup_regional_parameters(
         self,
-        index="vegetation-vigor-index",
+        index: RegionalIndex = "vegetation-vigor-index",
         start_date="2025-01-01",
         end_date=None,
         fillyeargap=False,
@@ -152,25 +175,7 @@ class RegionalExtractor(BaseExtractor):
             log.info(f"end_date defaulted to {end_date}")
 
         # Validate index
-        valid_indexes = {
-            "vegetation-vigor-index",
-            "daily-precipitation",
-            "soil-moisture",
-            "min-temperature",
-            "max-temperature",
-            "average-temperature",
-            "surface-temperature",
-            "etp",
-            "max-wind-speed",
-            "p-etp",
-            "relative-humidity",
-            "snow-depth",
-            "solar-radiation",
-        }
-        if index not in valid_indexes:
-            error_msg = f"Invalid index '{index}'. Must be one of {valid_indexes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        index = self._check_choice("index", index, RegionalIndex)
 
         # Validate start_date format
         try:
@@ -652,13 +657,14 @@ class RegionalExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="regional",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> RegionalBulkResult:
         """
         Bulk processing of entity regional data using threads + progress bar,
         with optional fail-safe retry and filter capabilities.
@@ -681,10 +687,14 @@ class RegionalExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "regional".
             use_cache (bool, optional): If True, use caching for bulk extraction. Default: None (uses instance setting).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains TWO results DataFrames (observed_data and daily_avg_data), errors list, and summary statistics.
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache or (use_cache is None and getattr(self, "_cache_enabled", False)):
             return self._bulk_with_cache(
                 bulk_method=self._process_entity_regional_bulk_parallel_inner,
@@ -734,7 +744,7 @@ class RegionalExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="regional",
         generate_report=False,
@@ -756,11 +766,7 @@ class RegionalExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -796,10 +802,12 @@ class RegionalExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_regional)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             amu_col = self.get_mapped_column("amu_id")
             future_to_id = {
-                executor.submit(self.process_single_entity_regional, row.to_dict(), params): row.get(amu_col)
+                executor.submit(paced, row.to_dict(), params): row.get(amu_col)
                 for _, row in filtered_entity_list.iterrows()
             }
 
@@ -856,14 +864,14 @@ class RegionalExtractor(BaseExtractor):
                                 f"Entity {entity_id} - Incrementing successful_calculations to {successful_calculations}"
                             )
 
-                            if has_observed:
+                            if has_observed and observed_df is not None:
                                 all_observed_rows.append(observed_df)
                                 buffer_observed_rows.append(observed_df)
                                 log.debug(
                                     f"Entity {entity_id} - Added {len(observed_df)} observed rows. Total observed lists: {len(all_observed_rows)}"
                                 )
 
-                            if has_daily_avg:
+                            if has_daily_avg and daily_avg_df is not None:
                                 all_daily_avg_rows.append(daily_avg_df)
                                 buffer_daily_avg_rows.append(daily_avg_df)
                                 log.debug(

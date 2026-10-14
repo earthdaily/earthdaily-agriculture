@@ -5,13 +5,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
 
+# Internal
+from typing import Literal
+
 import pandas as pd
 
 # Third-Party
 import requests
 from tqdm import tqdm
 
-# Internal
 from earthdaily.agriculture.config.urls import agro_urls
 from earthdaily.agriculture.core.api_utils import (
     export_results,
@@ -20,11 +22,14 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import DEFAULT_SPATIAL_PRECISION, BaseExtractor, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import get_centroid_wkt, validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import SpatialBulkResult
 
 # --- Valid values ---
-VALID_PROVIDERS = {"GLOBAL1"}
+# Allowed values, read by the validator and by generate_ai_context.
+GddOffsetProvider = Literal["GLOBAL1"]
 
 
 def require_gdd_offset_params(func):
@@ -50,13 +55,13 @@ class GDDOffsetExtractor(BaseExtractor):
     a wide DataFrame: one row per entity with one column per requested
     offset (``offset_<N>`` → reached date).
 
-    Endpoint: ``{weather_url}/analytics/gdd-offset``
-
     Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_GDDOffset.ipynb
+    OpenAPI: https://api.geosys-na.net/Weather/v1/swagger/v2.0/swagger.json
+    Operation: GET /analytics/gdd-offset
 
     Args (setup_gdd_offset_parameters):
-        provider (str): Weather data provider. Default: 'GLOBAL1'
+        provider (GddOffsetProvider): Weather data provider. Default: 'GLOBAL1'
         lower_threshold (float): Lower GDD temperature threshold. Default: 10.0
         upper_threshold (float): Upper GDD temperature threshold. Default: 30.0
         date (str): Base date in YYYY-MM-DD the offsets are measured from (maps to API Date). Default: None
@@ -73,6 +78,9 @@ class GDDOffsetExtractor(BaseExtractor):
     Output columns:
         entity_id, offset_<N> (one column per requested offset; value = date the
         offset is reached, YYYY-MM-DD)
+
+    Constraints:
+        - lower_threshold must be below upper_threshold.
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -97,7 +105,7 @@ class GDDOffsetExtractor(BaseExtractor):
     @requires_token
     def setup_gdd_offset_parameters(
         self,
-        provider="GLOBAL1",
+        provider: GddOffsetProvider = "GLOBAL1",
         lower_threshold=10.0,
         upper_threshold=30.0,
         date=None,
@@ -113,7 +121,7 @@ class GDDOffsetExtractor(BaseExtractor):
         Configure parameters for GDD offset extraction.
 
         Args:
-            provider (str): Weather data provider (default ``'GLOBAL1'``).
+            provider (GddOffsetProvider): Weather data provider (default ``'GLOBAL1'``).
             lower_threshold (float): Lower GDD temperature threshold.
             upper_threshold (float): Upper GDD temperature threshold.
             date (str, optional): Base date (``YYYY-MM-DD``). Default ``None``
@@ -127,8 +135,7 @@ class GDDOffsetExtractor(BaseExtractor):
             use_cache (bool, optional): Per-call cache override.
         """
         # Provider validation
-        if provider not in VALID_PROVIDERS:
-            raise ValueError(f"Invalid provider '{provider}'. Must be one of {VALID_PROVIDERS}.")
+        provider = self._check_choice("provider", provider, GddOffsetProvider)
 
         # Threshold validation
         for label, val in (("lower_threshold", lower_threshold), ("upper_threshold", upper_threshold)):
@@ -144,7 +151,7 @@ class GDDOffsetExtractor(BaseExtractor):
             except ValueError:
                 raise ValueError(f"Invalid date '{date}'. Expected YYYY-MM-DD.")
 
-        # Offsets normalisation (optional)
+        # Offsets normalization (optional)
         offsets_norm = self._normalise_offsets(offsets) if offsets is not None else None
 
         if column_mapping:
@@ -383,7 +390,7 @@ class GDDOffsetExtractor(BaseExtractor):
         if params is None:
             params = self.gdd_offset_params
 
-        # Normalise row to dict
+        # Normalize row to dict
         try:
             if isinstance(row, pd.DataFrame):
                 if len(row) > 1:
@@ -442,7 +449,7 @@ class GDDOffsetExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="gdd_offset",
         generate_report=False,
@@ -450,7 +457,8 @@ class GDDOffsetExtractor(BaseExtractor):
         use_cache=None,
         spatial_grouping=False,
         spatial_precision=DEFAULT_SPATIAL_PRECISION,
-    ):
+        rate_limit=None,
+    ) -> SpatialBulkResult:
         """
         Bulk GDD offset extraction with threading, partial saves, and merge logic.
 
@@ -461,10 +469,15 @@ class GDDOffsetExtractor(BaseExtractor):
             spatial_grouping (bool): If True, group fields by ``geohash(centroid) ×
                 start_date × offsets × provider``, call the API once per group and
                 broadcast. The forecast reached-date is a function of the centroid,
-                base date, thresholds and offsets — safe to dedup across neighbours.
+                base date, thresholds and offsets — safe to dedup across neighbors.
             spatial_precision (int): Geohash precision for the bucket (default
                 ``DEFAULT_SPATIAL_PRECISION``).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
         """
+
+        self._bulk_rate_limit = rate_limit  # read by _paced()
 
         def _dispatch(
             el, *, skip_export_=skip_export, generate_report_=generate_report, report_options_=report_options
@@ -546,8 +559,7 @@ class GDDOffsetExtractor(BaseExtractor):
 
         if merge_existing is None:
             merge_existing = self.merge_existing
-        if merge_existing not in ("auto", "preserve", "mark"):
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from ['auto','preserve','mark']")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         filtered, skipped, skip_count = filter_entities(entity_list, filter_column, filter_value, filter_type)
 
@@ -568,10 +580,11 @@ class GDDOffsetExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_gdd_offset)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_gdd_offset, row, params): self.get_entity_value(row, "id")
-                for _, row in filtered.iterrows()
+                executor.submit(paced, row, params): self.get_entity_value(row, "id") for _, row in filtered.iterrows()
             }
 
             with tqdm(

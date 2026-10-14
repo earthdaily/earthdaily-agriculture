@@ -1,6 +1,6 @@
 ---
 title: Deployment patterns
-description: Two supported ways to operationalise an EarthDaily Agriculture extraction in production — GitHub Actions cron and a Docker container — with cost guidance and a migration path between them.
+description: Two supported ways to operationalize an EarthDaily Agriculture extraction in production — GitHub Actions cron and a Docker container — with cost guidance and a migration path between them.
 #icon: material/rocket-launch-outline
 keywords:
   - deployment
@@ -97,10 +97,10 @@ echo "report_path=$REPORT" >> "$GITHUB_OUTPUT"
 Why this stays clean:
 
 - Downstream steps (S3, FTP, Slack, artifact upload) are decoupled from the Python entrypoint.
-- No JSON parsing in shell. No env-file gymnastics. No temp-directory conventions to memorise.
+- No JSON parsing in shell. No env-file gymnastics. No temp-directory conventions to memorize.
 - Trivially testable: `python -m app.run_pipeline --limit 1 | tail -1` is the whole smoke test.
 
-For pipelines that emit multiple terminal artifacts, generalise to a tiny manifest — e.g. `REPORT_MANIFEST=<json path>` — and let the workflow loop. Don't parse arbitrary log lines.
+For pipelines that emit multiple terminal artifacts, generalize to a tiny manifest — e.g. `REPORT_MANIFEST=<json path>` — and let the workflow loop. Don't parse arbitrary log lines.
 
 ### Installing the package in CI
 
@@ -233,7 +233,7 @@ Two tiers — keep them named consistently across your projects:
 | API   | `PROD_API_CLIENT_ID`, `PROD_API_CLIENT_SECRET`, `PROD_API_USERNAME`, `PROD_API_PASSWORD` (`PREPROD_*` mirrors if needed) |
 | S3    | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `S3_BUCKET` (no `s3://`), `S3_PREFIX` (project-scoped)        |
 
-Move to OIDC (`aws-actions/configure-aws-credentials@v4` with `role-to-assume`) once key rotation becomes a compliance question or you're operationalising more than ~3 extractions.
+Move to OIDC (`aws-actions/configure-aws-credentials@v4` with `role-to-assume`) once key rotation becomes a compliance question or you're operationalizing more than ~3 extractions.
 
 ### Schedule choices
 
@@ -261,36 +261,112 @@ A container image whose entrypoint is the extraction CLI. The same image runs ev
 - Multi-step orchestration with retries / DAG semantics.
 - Already on Kubernetes / ECS and prefer to avoid GitHub Actions for production traffic.
 
-### Dockerfile (multi-stage)
+### The two images
 
-Typical image sizes: single-stage ~1.2 GB, multi-stage ~600 MB.
+A scaffolded project ships two Dockerfiles. Both run the same entrypoint
+(`python -m app.run_pipeline`) with the same CLI, as a non-root user, with
+`EDAGRO_LOG_CONSOLE_ONLY=1` so stdout is the log stream.
 
-```dockerfile
-# ---- Stage 1: build wheel ----
-FROM python:3.12-slim AS builder
-WORKDIR /build
-COPY pyproject.toml requirements.txt ./
-COPY src/ ./src/
-RUN pip install --no-cache-dir build && python -m build --wheel
+| | `Dockerfile` | `Dockerfile.headless` |
+|---|---|---|
+| For | `docker run`, scheduled jobs, CI — anything the project's notebooks also do | large stateless runs: one shard per container, then exit |
+| Installs | the project's `requirements.txt` (`earthdaily-agriculture` from PyPI, or the wheel in `dist/` with `--use-local-wheel`) | `earthdaily-agriculture` + **one** cloud extra (`[s3]`, or `--build-arg CLOUD_EXTRA=azure`) — no notebook or plotting tooling |
+| Build | single stage | two stages: install into a virtualenv, copy only that; bundled `tests/` folders stripped |
+| Storage | local by default; S3 when `EDAGRO_OUTPUT_PREFIX` is set (uncomment `s3fs` in `requirements.txt`) | `EDAGRO_STORAGE=s3` — **refuses to start** unless outputs resolve to a remote URI |
+| Size (2.6.1, measured) | 1.87 GB | **1.45 GB** |
 
-# ---- Stage 2: runtime ----
-FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgdal32 \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /build/dist/*.whl /tmp/
-RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl
-
-RUN useradd --create-home --shell /bin/bash earthdaily-agriculture
-USER earthdaily-agriculture
-WORKDIR /home/earthdaily-agriculture
-
-ENTRYPOINT ["earthdaily-agriculture"]
-CMD ["--help"]
+```bash
+docker build -t my-project:2.6.1 .                                   # general image
+docker build -f Dockerfile.headless -t my-project-headless:2.6.1 .   # stateless runs
 ```
 
-If you don't have project-specific code beyond the workflow config, you can drop the build stage and just `pip install earthdaily-agriculture==X.Y.Z` directly in the runtime stage.
+Neither image installs system GDAL: the rasterio / pyogrio / shapely / pyproj wheels bundle
+their own, and only need `libexpat1` at import. (A Debian-versioned package such as
+`libgdal32` disappears with base-image upgrades — it broke the template image once.)
+
+Most of the remaining size is the package's own dependencies; optional dependency groups
+(an extraction-only install without the visualization and analysis libraries) are planned
+for 2.7.
+
+### Large stateless runs (100k entities and up)
+
+Small runs keep `app/run_pipeline.py` and `configuration/workflow.yml` through
+`WorkflowManager`. Large ones skip the workflow: the entity list is split into shards,
+**one container per shard** builds the extractor directly, and the results are merged.
+Any scheduler can drive it — the contract is four commands, all run from the
+`Dockerfile.headless` image (its entrypoint is `python -m`, so the module comes first).
+
+| Step | Command | Prints (last line) |
+|---|---|---|
+| 1. Fan-out | `app.dispatch_shards --entities <table> --base <run> (--num-shards N \| --rate R [--target-minutes 15])` | `SHARDS_PATH=<run>/shards.json`, `NUM_SHARDS=<n>` |
+| 2. One container per shard | `app.run_extractor --extractor <Class> --setup '<json>' [--run '<json>'] --manifest <run> --shard <i>` | `REPORT_PATH=<run>/shard-<i>/results/…_final.csv` |
+| 3. Retry pass (per shard) | the same command plus `--retry-failed` | `REPORT_PATH=…` (exit 0 when there was nothing to retry) |
+| 4. Fan-in | `app.merge_shards --base <run> --prefix <prefix> [--require-all]` | `REPORT_PATH=<run>/merged/results/…_final.csv` |
+
+Exit codes: **0** done — entities that failed are recorded in `failed_ids_*.csv`, not
+fatal (`fail_safe=True` is always on); **1** no result at all; **2** bad arguments, or
+`EDAGRO_STORAGE=s3` with outputs that would land on the container's disk.
+
+A neutral example with plain `docker run` — the same commands go in any scheduler's
+job definition:
+
+```bash
+IMG=my-project-headless:2.6.1
+RUN=s3://my-bucket/runs/run_$(date -u +%Y%m%d)
+CREDS="-e PROD_API_CLIENT_ID -e PROD_API_CLIENT_SECRET -e PROD_API_USERNAME -e PROD_API_PASSWORD -e AWS_DEFAULT_REGION"
+
+# 1. fan-out, sized for weather (~89 entities/min per container) and 15-minute containers.
+#    Weather reads its window per entity: fields.parquet carries id, geometry,
+#    start_date and end_date columns.
+NUM_SHARDS=$(docker run --rm $CREDS $IMG app.dispatch_shards \
+  --entities s3://my-bucket/inputs/fields.parquet --base $RUN --rate 89 --target-minutes 15 \
+  | grep '^NUM_SHARDS=' | cut -d= -f2)
+
+# 2. one container per shard — run these in parallel, as many at once as the API allows
+for i in $(seq 0 $((NUM_SHARDS - 1))); do
+  docker run --rm $CREDS $IMG app.run_extractor --extractor WeatherExtractor \
+    --setup '{"weather_parameters": "precipitation.cumulative"}' --run '{"spatial_grouping": true}' \
+    --manifest $RUN --shard $i --prefix weather
+done
+
+# 3. retry pass: only the entities each shard recorded as failed
+for i in $(seq 0 $((NUM_SHARDS - 1))); do
+  docker run --rm $CREDS $IMG app.run_extractor --extractor WeatherExtractor \
+    --setup '{"weather_parameters": "precipitation.cumulative"}' \
+    --manifest $RUN --shard $i --prefix weather --retry-failed
+done
+
+# 4. fan-in
+docker run --rm $CREDS $IMG app.merge_shards --base $RUN --prefix weather
+```
+
+**Sizing.** `--rate` is one container's throughput for that extractor at its
+`--max-workers` (default 10). Measured on 2026-10-02 with 200 fields:
+
+| Extractor | Entities / minute | Fits in a 15-minute container |
+|---|---|---|
+| Coverage | ~960 | ~11 500 |
+| GDD | ~325 | ~3 900 |
+| MRTS (`historical_years=0`) | ~320 | ~3 800 |
+| Weather | ~89 | ~1 070 |
+
+Container start-up (imports, token) is about 1.5 s, so many small shards cost little —
+and a crashed container redoes only its own shard (partials are not read back; see
+*13 — Cloud storage*, principle 4).
+
+**Concurrency is the scheduler's job.** The API sees
+`containers running at once × --max-workers` concurrent requests (10 containers × 10
+threads = 100). Cap how many shard containers run at once to stay under the API's rate
+limits; the number of shards only decides how much work each one does.
+
+**Merge semantics.** A shard can hold several result files — a retry pass adds one with
+only the retried entities, a re-run shard adds a full one. The merge keeps, for each
+entity, the rows from the newest file that has it, so nothing is lost or doubled. Map
+files (`postprocess="file"`) stay under each shard's `results/maps`.
+
+The building blocks are in the package (`earthdaily.agriculture.core.sharding`:
+`split_entities`, `plan_num_shards`, `select_shard`, `find_report`, `merge_shards`) if
+you would rather drive them from your own code.
 
 ### `.dockerignore`
 
@@ -373,7 +449,7 @@ For notebooks that need an explicit assertion rather than relying on the env var
 -e AWS_S3_FORCE_PATH_STYLE=true
 ```
 
-Both are honoured by `boto3` and therefore by `fsspec`.
+Both are honored by `boto3` and therefore by `fsspec`.
 
 ### Heartbeat / healthcheck
 

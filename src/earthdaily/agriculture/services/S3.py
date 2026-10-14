@@ -20,7 +20,29 @@ from botocore.exceptions import ClientError
 from loguru import logger
 
 # Internal Project Utilities
+from earthdaily.agriculture.core import storage
 from earthdaily.agriculture.core.geometry import filter_gdf_by_spatial_relation
+from earthdaily.agriculture.core.identity import EDAuthenticator
+
+
+def _resolve_client(authenticator):
+    """The boto3 S3 client to use, from whatever the caller passed as ``authenticator``.
+
+    Every method's first argument keeps its name for compatibility, but S3 no longer
+    needs authentication, so it accepts:
+
+    - ``None``: the shared client from :func:`storage.get_s3_client`;
+    - an ``EDAuthenticator``: its ``s3_client`` (created on first access);
+    - any other object with ``ensure_s3_client()``: that (older duck-typed callers);
+    - otherwise, the object itself is taken to be a boto3 S3 client.
+    """
+    if authenticator is None:
+        return storage.get_s3_client()
+    if isinstance(authenticator, EDAuthenticator):
+        return authenticator.s3_client
+    if hasattr(authenticator, "ensure_s3_client"):
+        return authenticator.ensure_s3_client()
+    return authenticator
 
 
 class S3ObjectNotFound(ValueError):
@@ -60,10 +82,11 @@ class EDA_S3_cloudstore:
         Initialize S3 cloud storage handler.
 
         Args:
-            authenticator: EDAuthenticator instance with initialized s3_client
+            authenticator: An EDAuthenticator, a boto3 S3 client, or None for the shared
+                client (see ``_resolve_client``).
         """
         self.authenticator = authenticator
-        self.s3_client = authenticator.ensure_s3_client()
+        self.s3_client = _resolve_client(authenticator)
         logger.info("✅ EDA_S3_cloudstore initialized")
 
     # ========================================================================
@@ -78,7 +101,7 @@ class EDA_S3_cloudstore:
         Check if a Parquet file is a valid GeoParquet and optionally check bbox support.
 
         Args:
-            authenticator: EDAuthenticator instance with s3_client
+            authenticator: EDAuthenticator, boto3 S3 client, or None (shared client)
             bucket_name: Name of the S3 bucket
             file_key: S3 key (path) to the Parquet file
             check_bbox: If True, also check if file supports bbox filtering
@@ -91,7 +114,7 @@ class EDA_S3_cloudstore:
                 - 'supports_bbox': bool
                 - 'bbox_method': str (None, 'covering', or 'point')
         """
-        s3_client = authenticator.ensure_s3_client()
+        s3_client = _resolve_client(authenticator)
 
         try:
             if verbose:
@@ -174,7 +197,7 @@ class EDA_S3_cloudstore:
         Get detailed information about a Parquet/GeoParquet file.
 
         Args:
-            authenticator: EDAuthenticator instance with s3_client
+            authenticator: EDAuthenticator, boto3 S3 client, or None (shared client)
             bucket_name: Name of the S3 bucket
             file_key: S3 key (path) to the Parquet file
             verbose: Whether to log information
@@ -182,7 +205,7 @@ class EDA_S3_cloudstore:
         Returns:
             dict: File information including schema, metadata, and GeoParquet status
         """
-        s3_client = authenticator.ensure_s3_client()
+        s3_client = _resolve_client(authenticator)
 
         try:
             if verbose:
@@ -261,7 +284,7 @@ class EDA_S3_cloudstore:
         Supports CSV, Parquet, and GeoParquet files with automatic type detection.
 
         Args:
-            authenticator: EDAuthenticator instance with s3_client
+            authenticator: EDAuthenticator, boto3 S3 client, or None (shared client)
             bucket_name: Name of the S3 bucket
             file_key: S3 key (path) to the file
             file_type: File type ('csv', 'parquet', 'geoparquet', 'auto').
@@ -283,7 +306,7 @@ class EDA_S3_cloudstore:
             >>> df = EDA_S3_cloudstore.read_from_s3(auth, 'bucket', 'data.csv')
             >>> gdf = EDA_S3_cloudstore.read_from_s3(auth, 'bucket', 'geo.parquet', safe=True)
         """
-        s3_client = authenticator.ensure_s3_client()
+        s3_client = _resolve_client(authenticator)
 
         # Auto-detect file type from extension
         if file_type == "auto":
@@ -445,14 +468,14 @@ class EDA_S3_cloudstore:
                 df = EDA_S3_cloudstore.read_csv(auth, bucket, key)
 
         Args:
-            authenticator: EDAuthenticator instance with s3_client
+            authenticator: EDAuthenticator, boto3 S3 client, or None (shared client)
             bucket_name: Name of the S3 bucket
             file_key: S3 key (path) to check
 
         Returns:
             bool: True if the key exists, False if it does not.
         """
-        s3_client = authenticator.ensure_s3_client()
+        s3_client = _resolve_client(authenticator)
         try:
             s3_client.head_object(Bucket=bucket_name, Key=file_key)
             return True
@@ -479,14 +502,14 @@ class EDA_S3_cloudstore:
         Write a DataFrame to S3 as CSV or Parquet using the boto3 client.
 
         Symmetric counterpart to :meth:`read_from_s3` — serializes to an in-memory
-        buffer and ``put_object``s it on the same ``authenticator.ensure_s3_client()``
+        buffer and ``put_object``s it on the same client the readers use
         client, so it works without the optional ``[s3]``/s3fs extra.
 
         ``index=False`` is the default (matching the wheel's export convention);
         pass ``index=True`` in ``write_kwargs`` to override.
 
         Args:
-            authenticator: EDAuthenticator instance with s3_client
+            authenticator: EDAuthenticator, boto3 S3 client, or None (shared client)
             df: DataFrame (or GeoDataFrame) to write
             bucket_name: Name of the S3 bucket
             file_key: S3 key (path) to write to
@@ -504,7 +527,7 @@ class EDA_S3_cloudstore:
             ClientError: If the S3 put fails
             ValueError: If file_type cannot be resolved or is unsupported
         """
-        s3_client = authenticator.ensure_s3_client()
+        s3_client = _resolve_client(authenticator)
 
         # Resolve file type — mirror read_from_s3: infer from extension, never
         # silently default.
@@ -587,7 +610,7 @@ class EDA_S3_cloudstore:
         boto3's ``upload_file`` (no full read into memory).
 
         Args:
-            authenticator: EDAuthenticator instance with s3_client
+            authenticator: EDAuthenticator, boto3 S3 client, or None (shared client)
             bucket_name: Name of the S3 bucket
             file_key: S3 key (path) to write to
             local_path: Path to the local file to upload
@@ -600,7 +623,7 @@ class EDA_S3_cloudstore:
             ClientError: If the S3 upload fails
             FileNotFoundError: If local_path does not exist
         """
-        s3_client = authenticator.ensure_s3_client()
+        s3_client = _resolve_client(authenticator)
         local_path = str(local_path)
         if not os.path.isfile(local_path):
             raise FileNotFoundError(f"Local file not found: {local_path}")
@@ -626,7 +649,7 @@ class EDA_S3_cloudstore:
         local path). Convenience loop over :meth:`upload_file`.
 
         Args:
-            authenticator: EDAuthenticator instance with s3_client
+            authenticator: EDAuthenticator, boto3 S3 client, or None (shared client)
             bucket_name: Name of the S3 bucket
             local_paths: Iterable of local file paths to upload
             s3_prefix: Key prefix to upload under (e.g. ``"runs/2026-06-12"``).
@@ -668,7 +691,7 @@ class EDA_S3_cloudstore:
         Read GeoParquet from S3 with spatial filtering (uses temp file for bbox filtering).
 
         Args:
-            authenticator: EDAuthenticator instance
+            authenticator: EDAuthenticator, boto3 S3 client, or None (shared client)
             bucket_name: S3 bucket name
             file_key: S3 file key
             bbox: Bounding box filter (minx, miny, maxx, maxy)
@@ -685,7 +708,7 @@ class EDA_S3_cloudstore:
         """
         from shapely import wkt
 
-        s3_client = authenticator.ensure_s3_client()
+        s3_client = _resolve_client(authenticator)
 
         # Validate if safe mode
         if safe:

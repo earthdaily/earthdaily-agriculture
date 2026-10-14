@@ -149,7 +149,7 @@ class TestGetGdd:
     def test_pandas_timestamp_dates_converted_to_string(
         self, mock_get, mock_wkt, mock_centroid, configured_gdd_extractor
     ):
-        """pd.Timestamp dates should be normalised to YYYY-MM-DD strings."""
+        """pd.Timestamp dates should be normalized to YYYY-MM-DD strings."""
         entity = {
             "id": "test_001",
             "geometry": GDD_POINT_WKT,

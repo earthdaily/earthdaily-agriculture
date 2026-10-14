@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from io import BytesIO
+from typing import Literal, get_args
 from zipfile import ZipFile
 
 import pandas as pd
@@ -21,22 +22,20 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
+
+# Allowed values: one list each, read by the validator (BaseExtractor._check_choice)
+# and by generate_ai_context. Declared here, never repeated in a docstring.
+DifferencePostprocess = Literal["stats", "links", "file"]
+DifferenceMapFormat = Literal["png", "tiff.zip", "shp.zip", None]
 
 # Supported difference map products — use short index name as key
-DIFFERENCE_PRODUCTS = {
-    "NDVI": "DIFFERENCE_NDVI",
-    "EVI": "DIFFERENCE_EVI",
-    "GNDVI": "DIFFERENCE_GNDVI",
-    "NDRE": "DIFFERENCE_NDRE",
-    "CVI": "DIFFERENCE_CVI",
-    "CVIN": "DIFFERENCE_CVIN",
-    "LAI": "DIFFERENCE_LAI",
-    "NDWI": "DIFFERENCE_NDWI",
-    "NDMI": "DIFFERENCE_NDMI",
-    "S2REP": "DIFFERENCE_S2REP",
-}
+DifferenceProduct = Literal["NDVI", "EVI", "GNDVI", "NDRE", "CVI", "CVIN", "LAI", "NDWI", "NDMI", "S2REP"]
+# The API product name for each short name; the full name ('DIFFERENCE_NDVI') is accepted too.
+DIFFERENCE_PRODUCTS = {k: f"DIFFERENCE_{k}" for k in get_args(DifferenceProduct)}
 
 
 def require_difference_params(func):
@@ -63,12 +62,15 @@ class DifferenceExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Field%20Level%20Maps/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_difference.ipynb
+    OpenAPI: https://api.geosys-na.net/field-level-maps/v5/swagger/v1/swagger.json
+    Operation: POST /maps/difference-map/{mapType}
 
     Args (setup_difference_parameters):
-        product (str): Vegetation index short name (e.g. 'NDVI', 'EVI'). Default: 'NDVI'
+        product (DifferenceProduct): Vegetation index the difference is computed for; the full
+            product name ('DIFFERENCE_NDVI') is accepted too. Default: 'NDVI'
         output_epsg (int): Output coordinate system. Default: 4326
-        postprocess (str): Processing mode - 'stats', 'links', or 'file'. Default: 'stats'
-        map_format (str): Output format for file mode ('png', 'tiff.zip', 'shp.zip'). Default: None
+        postprocess (DifferencePostprocess): What to return: field statistics, download links, or files on disk. Default: 'stats'
+        map_format (DifferenceMapFormat): Output file format, used with postprocess='file'. Default: None
         output_path (str): Directory for file downloads. Default for postprocess='file': <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX.
         directLinks (bool): Request direct download links from API. Default: False
         partial_frequency (int): How often to save partial results. Default: 50
@@ -108,10 +110,10 @@ class DifferenceExtractor(BaseExtractor):
 
     def setup_difference_parameters(
         self,
-        product="NDVI",
+        product: DifferenceProduct | str = "NDVI",
         output_epsg=4326,
-        postprocess="stats",
-        map_format=None,
+        postprocess: DifferencePostprocess = "stats",
+        map_format: DifferenceMapFormat = None,
         output_path=None,
         skip_existing=True,
         directLinks=False,
@@ -126,12 +128,11 @@ class DifferenceExtractor(BaseExtractor):
         Configure parameters for difference map extraction.
 
         Args:
-            product (str): Vegetation index short name. Default: 'NDVI'
-                Supported values: NDVI, EVI, GNDVI, NDRE, CVI, CVIN, LAI
-                Also accepts full names (e.g. 'DIFFERENCE_NDVI')
+            product (DifferenceProduct): Vegetation index short name. Default: 'NDVI'
+                Also accepts the full product name (e.g. 'DIFFERENCE_NDVI').
             output_epsg (int): Output EPSG code for projection. Default: 4326
-            postprocess (str): Processing mode - 'stats', 'links', or 'file'. Default: 'stats'
-            map_format (str): Output format for file mode ('png', 'tiff.zip', 'shp.zip'). Default: None
+            postprocess (DifferencePostprocess): What to return: field statistics, download links, or files on disk. Default: 'stats'
+            map_format (DifferenceMapFormat): Output file format, used with postprocess='file'. Default: None
             output_path (str): Directory for file downloads. Default for postprocess='file': <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX.
             skip_existing (bool): Skip download if file already exists. Default: True
             directLinks (bool): Request direct download links. Default: False
@@ -155,18 +156,10 @@ class DifferenceExtractor(BaseExtractor):
             raise ValueError(error_msg)
 
         # Postprocess validation
-        valid_postprocess = {"stats", "links", "file"}
-        if postprocess not in valid_postprocess:
-            error_msg = f"Invalid postprocess '{postprocess}'. Must be one of {valid_postprocess}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        postprocess = self._check_choice("postprocess", postprocess, DifferencePostprocess)
 
         # Map format validation
-        valid_formats = {"png", "tiff.zip", "shp.zip", None}
-        if map_format not in valid_formats:
-            error_msg = f"Invalid map_format '{map_format}'. Must be one of {valid_formats}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        map_format = self._check_choice("map_format", map_format, DifferenceMapFormat)
 
         # Cross-validation: postprocess='links' requirements
         if postprocess == "links":
@@ -720,13 +713,14 @@ class DifferenceExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="difference",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of entity difference maps using threads + progress bar,
         with optional fail-safe retry and filter capabilities.
@@ -750,10 +744,14 @@ class DifferenceExtractor(BaseExtractor):
             generate_report (bool, optional): Generate HTML report. Default: False.
             report_options (dict, optional): Report configuration options.
             use_cache (bool, optional): Enable/disable caching for this call.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics.
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache is not None and use_cache:
             return self._bulk_with_cache(
                 bulk_method=self._process_entity_difference_bulk_parallel_inner,
@@ -803,7 +801,7 @@ class DifferenceExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="difference",
         generate_report=False,
@@ -827,11 +825,7 @@ class DifferenceExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -864,9 +858,11 @@ class DifferenceExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_difference)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_difference, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

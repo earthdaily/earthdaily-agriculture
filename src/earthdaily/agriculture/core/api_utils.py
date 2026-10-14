@@ -2,11 +2,14 @@ import math
 import os
 import random
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import pandas as pd
 import requests
 from tqdm import tqdm
+
+from earthdaily.agriculture.core.rate_limit import current_limiter, take_turn
 
 # Supported result-export formats. Errors are always written as CSV (tiny,
 # human-read) regardless of this setting.
@@ -247,7 +250,7 @@ def safe_parse_date(date_str):
         return datetime.strptime(date_str, "%Y-%m-%d").date().isoformat()
     except ValueError:
         # Try fallback MM-DD format (as in historical averages). Pin a leap year
-        # (2000) so 02-29 validates and behaviour is stable across Python versions:
+        # (2000) so 02-29 validates and behavior is stable across Python versions:
         # a bare "%m-%d" defaults to year 1900 (non-leap, so 02-29 would raise) and
         # is deprecated from Python 3.15.
         try:
@@ -257,26 +260,75 @@ def safe_parse_date(date_str):
             return date_str  # leave as-is if unrecognized
 
 
-def retry_with_backoff_no_retry_on_400(func, max_retries=5, base_delay=1.0, max_delay=60.0, *args, **kwargs):
+#: Ceiling on a server-supplied ``Retry-After`` wait, so a bad header cannot park a
+#: worker for hours. Deliberately separate from ``max_delay``: when the server says how
+#: long to wait, waiting less just earns another 429.
+RETRY_AFTER_CAP_SECONDS = 300.0
+
+
+def _retry_after_seconds(response):
+    """Seconds to wait from a ``Retry-After`` header, or ``None`` if absent or unreadable.
+
+    The header is either a number of seconds or an HTTP date (RFC 9110 §10.2.3).
+    """
+    if response is None:
+        return None
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    return min(max(seconds, 0.0), RETRY_AFTER_CAP_SECONDS)
+
+
+def retry_with_backoff_no_retry_on_400(
+    func, max_retries=5, base_delay=1.0, max_delay=60.0, *args, rate_limiter=None, **kwargs
+):
     """
     Retries a function call with exponential backoff and jitter.
-    Skips retry if a 400-series client error is returned.
+    Skips retry if a 400-series client error is returned — except 429.
+
+    429 (Too Many Requests) is the server asking the caller to slow down, not a
+    bad request: it is retried, waiting the ``Retry-After`` header when the server
+    sends one (capped at ``RETRY_AFTER_CAP_SECONDS``), else the usual backoff.
+    5xx responses honor ``Retry-After`` the same way (typically a 503).
+    No wait follows the final attempt: once the retries are spent, the error is
+    raised at once.
+
+    Inside a rate-limited bulk run every attempt is paced, retries included: each one
+    takes a turn from the run's limiter (``rate_limit.take_turn``; the first spends the
+    token the bulk wrapper already took), and a 429 holds every worker of the run for
+    the wait (``RateLimiter.penalize``). Outside one, nothing changes.
 
     Args:
         func (callable): The function to call.
         max_retries (int): Max retry attempts before failing.
         base_delay (float): Base delay (in seconds) for exponential backoff.
-        max_delay (float): Maximum backoff delay in seconds.
+        max_delay (float): Maximum backoff delay in seconds (does not cap ``Retry-After``).
         *args, **kwargs: Arguments passed to func.
+        rate_limiter (RateLimiter, optional): Limiter to pace attempts with. Defaults to
+            the one the bulk run bound to this thread; None outside a limited run.
 
     Returns:
         Any: The result of func(*args, **kwargs).
 
     Raises:
-        ValueError: For 400-series client errors (non-retriable).
+        ValueError: For 400-series client errors (non-retriable), and for a 429
+            still returned after ``max_retries`` attempts.
         RuntimeError: If all retries fail.
     """
+    last_throttled = None
     for attempt in range(max_retries):
+        take_turn(rate_limiter)
         try:
             return func(*args, **kwargs)
 
@@ -287,7 +339,7 @@ def retry_with_backoff_no_retry_on_400(func, max_retries=5, base_delay=1.0, max_
             # function exists to short-circuit, and a 403 was retried 5x with backoff
             # (~83s) while logging "HTTP None". Same trap as truthiness on a pd.Series.
             status_code = http_err.response.status_code if http_err.response is not None else None
-            if status_code is not None and 400 <= status_code < 500:
+            if status_code is not None and 400 <= status_code < 500 and status_code != 429:
                 # Non-retriable client-side error. The body carries the only
                 # actionable detail (e.g. which entitlement a 403 is missing);
                 # `str(http_err)` gives status + URL and drops it.
@@ -297,20 +349,49 @@ def retry_with_backoff_no_retry_on_400(func, max_retries=5, base_delay=1.0, max_
                     print(f"   Response body: {body}")
                 raise ValueError(f"HTTP {status_code}: {http_err}{f' | {body}' if body else ''}")
             else:
-                wait = min(base_delay * (2**attempt) + random.uniform(0, base_delay), max_delay)
-                print(f"⚠️ HTTP {status_code} → Retry {attempt + 1}/{max_retries} in {wait:.1f}s...")
+                last_throttled = http_err if status_code == 429 else None
+                retry_after = _retry_after_seconds(http_err.response)
+                if retry_after is not None:
+                    wait = retry_after
+                    reason = f"Retry-After {retry_after:.0f}s"
+                else:
+                    wait = min(base_delay * (2**attempt) + random.uniform(0, base_delay), max_delay)
+                    reason = "backoff"
+                if status_code == 429:
+                    # Hold the whole run, not only this worker (no-op outside a limited
+                    # run). Also on the last attempt: the other workers still need it.
+                    limiter = rate_limiter if rate_limiter is not None else current_limiter()
+                    if limiter is not None:
+                        limiter.penalize(wait)
+                if attempt == max_retries - 1:
+                    break  # out of attempts: no point sleeping before raising
+                print(f"⚠️ HTTP {status_code} → Retry {attempt + 1}/{max_retries} in {wait:.1f}s ({reason})...")
                 time.sleep(wait)
 
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as conn_err:
+            last_throttled = None
+            if attempt == max_retries - 1:
+                print(f"🌐 Network issue: {conn_err} (attempt {max_retries}/{max_retries})")
+                break
             wait = min(base_delay * (2**attempt) + random.uniform(0, base_delay), max_delay)
             print(f"🌐 Network issue: {conn_err} → Retry {attempt + 1}/{max_retries} in {wait:.1f}s...")
             time.sleep(wait)
 
         except Exception as e:
+            last_throttled = None
+            if attempt == max_retries - 1:
+                print(f"⚠️ Attempt {max_retries}/{max_retries} failed: {e}")
+                break
             wait = min(base_delay * (2**attempt) + random.uniform(0, base_delay), max_delay)
             print(f"⚠️ Retry {attempt + 1}/{max_retries} failed: {e}. Waiting {wait:.1f}s...")
             time.sleep(wait)
 
+    if last_throttled is not None:
+        # Still throttled after every attempt: surface it as the client error it was
+        # before 429 became retriable, so existing `except ValueError` handling holds.
+        body = last_throttled.response.text[:500] if last_throttled.response is not None else ""
+        print(f"❌ HTTP 429 after {max_retries} attempts: {last_throttled}")
+        raise ValueError(f"HTTP 429: {last_throttled}{f' | {body}' if body else ''}")
     raise RuntimeError(f"Function {func.__name__} failed after {max_retries} retries.")
 
 
@@ -318,7 +399,7 @@ def export_results(results_df, errors, output_path, prefix="coverage", partial=F
     """
     Export results to CSV or Parquet, and errors to CSV.
 
-    ``output_path`` may be a local directory (existing behaviour) or a remote
+    ``output_path`` may be a local directory (existing behavior) or a remote
     URI like ``s3://bucket/prefix``. Remote URIs route through fsspec via
     pandas' ``storage_options`` argument; credentials flow through the
     standard chain (env vars / IAM role / ``AWS_ENDPOINT_URL`` for MinIO).
@@ -337,7 +418,7 @@ def export_results(results_df, errors, output_path, prefix="coverage", partial=F
         verbose (bool): If True, print messages. Suppress for partials.
         export_format (str, optional): "csv" or "parquet". When None, falls back
             to ``EDAGRO_EXPORT_FORMAT`` then "csv". Inline partial flushes that
-            omit this arg therefore still honour the env var automatically.
+            omit this arg therefore still honor the env var automatically.
     """
     from earthdaily.agriculture.core._fs import ensure_dir, join_path, storage_options_for
 
@@ -947,3 +1028,25 @@ def format_kpi_results(kpi_result):
     }
 
     return pd.DataFrame(data)
+
+
+SPECIFIC_DATES_DEPRECATION = (
+    "extraction_mode='specific_dates' (and target_dates / load_target_dates) is deprecated "
+    "and will be removed in 3.0. Use extraction_mode='windows' with a start_date/end_date "
+    "range covering the dates you need, then filter the result to those dates."
+)
+
+
+def warn_specific_dates_deprecated(where: str, logger=None) -> None:
+    """Emit the one deprecation notice for specific-dates extraction.
+
+    A ``DeprecationWarning`` for code and test runners, plus a loguru WARNING, because
+    Python hides DeprecationWarning outside ``__main__`` by default — a notebook or a
+    scheduled run would otherwise never see it.
+    """
+    import warnings
+
+    message = f"{where}: {SPECIFIC_DATES_DEPRECATION}"
+    warnings.warn(message, DeprecationWarning, stacklevel=3)
+    if logger is not None:
+        logger.warning(f"⚠️ {message}")

@@ -158,7 +158,9 @@ def test_params_is_appended_so_positional_callers_are_unaffected():
     """Notebooks call this method with keywords, but anything positional must not shift."""
     names = list(inspect.signature(ZARCExtractor.process_zarc_bulk_extraction_parallel).parameters)
     assert names[:3] == ["self", "entity_list", "max_workers"]
-    assert names[-1] == "params"
+    # `params` was appended after every pre-existing parameter; anything added since goes after it.
+    assert names.index("params") == names.index("use_cache") + 1
+    assert names[names.index("params") + 1 :] == ["rate_limit"]
 
 
 class TestYamlDates:

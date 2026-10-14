@@ -171,7 +171,7 @@ python -m ipykernel install --user --name edagro
 
 ## Usage
 
-Initialise the workflow manager (handles auth, workspace directories, and token refresh):
+Initialize the workflow manager (handles auth, workspace directories, and token refresh):
 
 ```python
 from earthdaily.agriculture.services.workflow_manager import WorkflowManager

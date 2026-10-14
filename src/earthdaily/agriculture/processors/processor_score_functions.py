@@ -22,8 +22,10 @@ from earthdaily.agriculture.core.api_utils import (
     validate_historical_years,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import DataSource, DetailLevel, MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
 available_crops = {"CORN", "SECOND CORN", "SOYBEANS", "SUGARCANE", "COTTON", "OTHERS"}
 
@@ -115,6 +117,8 @@ class HistoricalScoreExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Historical_Potential_Score/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_historical_score.ipynb
+    OpenAPI: https://historical-potential-risk-score.aws.geosys.com/openapi.json
+    Operation: POST /launch
 
     Args (setup_historical_score_parameters):
         season_duration (int): Season length in days. Default: 120
@@ -123,15 +127,16 @@ class HistoricalScoreExtractor(BaseExtractor):
         threshold_start (float): Score threshold start. Default: 0.7
         year (int): Target year. Default: 2025
         historical_seasons (list): Historical season list for comparison. Default: None
-        data_source (str): Data source ('LR', 'MR'). Default: 'LR'
-        detail_level (str): Output detail ('full' or 'summary'). Default: 'full'
+        data_source (DataSource): Imagery resolution: low (LR) or medium (MR). Default: 'LR'
+        detail_level (DetailLevel): Output detail. Default: 'full'
         use_cache (bool): Reuse cached API responses and cache new results to avoid re-fetching. None uses the extractor's instance default. Default: None
 
     Entity fields (via column_mapping):
         id, geometry (required); crop, sowing_date (optional); historical_seasons (optional)
 
     Output columns:
-        entity_id, score, percentile, rank, + historical comparison metrics
+        entity_id, potential_score_<year>, season_break_<year> (one pair per season),
+        average_potential_score, olympic_mean_potential_score, standard_deviation, risk_score
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -173,10 +178,10 @@ class HistoricalScoreExtractor(BaseExtractor):
         threshold_start=0.7,
         year=2025,
         historical_seasons=None,
-        data_source="LR",
+        data_source: DataSource = "LR",
         publish_af=False,
         partial_frequency=50,
-        detail_level="full",
+        detail_level: DetailLevel = "full",
         column_mapping=None,
         output_mapping=None,
         exclude_columns=None,
@@ -194,10 +199,10 @@ class HistoricalScoreExtractor(BaseExtractor):
             year (int): Current year to analyze
             historical_seasons (list or None, optional): List of historical years for comparison (e.g., [2024, 2023, 2022]).
                                                         If None, no historical comparison. Default: None
-            data_source (str): Imagery type - 'LR' (low resolution) or 'MR' (medium resolution)
+            data_source (DataSource): Imagery resolution: low (LR) or medium (MR)
             publish_af (bool): Whether to publish to AF (includes id in payload if True). Default: False
             partial_frequency (int): How often to save partial results
-            detail_level (str): Output detail level - 'summary' (only averages) or 'full' (all per-season data). Default: 'full'
+            detail_level (DetailLevel): Output detail: 'summary' (only averages) or 'full' (all per-season data). Default: 'full'
         """
         self.logger.info("⚙️ Setting up historical score parameters...")
 
@@ -230,10 +235,7 @@ class HistoricalScoreExtractor(BaseExtractor):
             raise
 
         # Data source validation
-        available_sources = {"LR", "MR"}
-        if data_source not in available_sources:
-            self.logger.error(f"Invalid data_source '{data_source}'")
-            raise ValueError(f"Invalid data_source '{data_source}'. Choose from: {available_sources}")
+        data_source = self._check_choice("data_source", data_source, DataSource)
 
         # Publish AF validation
         if not isinstance(publish_af, bool):
@@ -241,10 +243,7 @@ class HistoricalScoreExtractor(BaseExtractor):
             raise ValueError(f"Invalid publish_af={publish_af}. Must be True or False.")
 
         # Detail level validation
-        valid_detail_levels = ["summary", "full"]
-        if detail_level not in valid_detail_levels:
-            self.logger.error(f"Invalid detail_level '{detail_level}'")
-            raise ValueError(f"Invalid detail_level='{detail_level}'. Choose from: {valid_detail_levels}")
+        detail_level = self._check_choice("detail_level", detail_level, DetailLevel)
 
         self.apply_cache_setting(use_cache)
 
@@ -419,7 +418,9 @@ class HistoricalScoreExtractor(BaseExtractor):
             return {"success": False, "data": None, "error": str(e), "seasonfield_id": entity_id}
 
     @require_historical_score_params
-    def format_historical_score_json(self, response_historical_score_json, params=None, detail_level="full"):
+    def format_historical_score_json(
+        self, response_historical_score_json, params=None, detail_level: DetailLevel = "full"
+    ):
         """
         Normalize historical_score API response into a clean pandas DataFrame.
 
@@ -443,10 +444,7 @@ class HistoricalScoreExtractor(BaseExtractor):
         self.logger.debug(f"Entity {entity_id}: Formatting JSON response with detail_level='{detail_level}'")
 
         # Validate detail_level
-        valid_levels = ["summary", "full"]
-        if detail_level not in valid_levels:
-            self.logger.error(f"Invalid detail_level '{detail_level}'")
-            raise ValueError(f"Invalid detail_level='{detail_level}'. Choose from: {valid_levels}")
+        detail_level = self._check_choice("detail_level", detail_level, DetailLevel)
 
         if not isinstance(response_historical_score_json, dict):
             self.logger.error(f"Entity {entity_id}: Response is not a dictionary")
@@ -578,13 +576,14 @@ class HistoricalScoreExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="historical_score",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of historical_score requests using threads + progress bar,
         with optional fail-safe retry, filter capabilities, and caching.
@@ -606,12 +605,16 @@ class HistoricalScoreExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "historical_score".
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics.
                   When cache is active, also includes cache_hit and cache_miss counts.
         """
         # Route through cache wrapper if caching is enabled
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
             return self._bulk_with_cache(
@@ -664,7 +667,7 @@ class HistoricalScoreExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="historical_score",
         generate_report=False,
@@ -682,10 +685,7 @@ class HistoricalScoreExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            self.logger.error(f"Invalid merge_existing='{merge_existing}'")
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         self.logger.debug(f"Merge mode: {merge_existing}")
 
@@ -718,12 +718,12 @@ class HistoricalScoreExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_historical_score)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             self.logger.debug(f"ThreadPoolExecutor started with {max_workers} workers")
             future_to_id = {
-                executor.submit(self.process_single_entity_historical_score, row, params): self.get_entity_value(
-                    row, "id"
-                )
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 
@@ -849,6 +849,8 @@ class InseasonScoreExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/In-season_Potential_Score/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_inseason_score.ipynb
+    OpenAPI: https://inseason-potential-score.aws.geosys.com/openapi.json
+    Operation: POST /launch
 
     Args (setup_inseason_score_parameters):
         season_duration (int): Season length in days. Default: 120
@@ -856,8 +858,8 @@ class InseasonScoreExtractor(BaseExtractor):
         season_start_month (int): Season start month. Default: 4
         threshold_start (float): Score threshold start. Default: 0.7
         year (int): Target year. Default: 2025
-        data_source (str): Data source ('LR', 'MR'). Default: 'LR'
-        detail_level (str): Output detail ('full' or 'summary'). Default: 'full'
+        data_source (DataSource): Imagery resolution: low (LR) or medium (MR). Default: 'LR'
+        detail_level (DetailLevel): Output detail. Default: 'full'
         historical_seasons (list): Explicit prior season years for the baseline. Default: None
         nb_historical_year (int): Number of historical years used for the baseline. Default: 1
         use_cache (bool): Reuse cached API responses and cache new results to avoid re-fetching. None uses the extractor's instance default. Default: None
@@ -866,7 +868,7 @@ class InseasonScoreExtractor(BaseExtractor):
         id, geometry (required); crop, sowing_date (optional)
 
     Output columns:
-        entity_id, score, status, trend, + current season metrics
+        entity_id, inseason_potential_score, historical_potential_score, relative_potential_score
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -908,10 +910,10 @@ class InseasonScoreExtractor(BaseExtractor):
         nb_historical_year=1,
         threshold_start=0.7,
         historical_seasons=None,
-        data_source="LR",
+        data_source: DataSource = "LR",
         publish_af=False,
         partial_frequency=50,
-        detail_level="full",
+        detail_level: DetailLevel = "full",
         column_mapping=None,
         output_mapping=None,
         exclude_columns=None,
@@ -929,10 +931,10 @@ class InseasonScoreExtractor(BaseExtractor):
             threshold_start (float): Threshold for season start detection (0.0-1.0). Default: 0.7
             historical_seasons (list or None, optional): List of historical years for comparison (e.g., [2024, 2023, 2022]).
                                                         If None, no historical comparison. Default: None
-            data_source (str): Imagery type - 'LR' (low resolution) or 'MR' (medium resolution)
+            data_source (DataSource): Imagery resolution: low (LR) or medium (MR)
             publish_af (bool): Whether to publish to AF (includes id in payload if True). Default: False
             partial_frequency (int): How often to save partial results
-            detail_level (str): Output detail level - 'summary' (only averages) or 'full' (all per-season data). Default: 'full'
+            detail_level (DetailLevel): Output detail: 'summary' (only averages) or 'full' (all per-season data). Default: 'full'
         """
         self.logger.info("⚙️ Setting up in-season score parameters...")
 
@@ -974,10 +976,7 @@ class InseasonScoreExtractor(BaseExtractor):
             raise
 
         # Data source validation
-        available_sources = {"LR", "MR"}
-        if data_source not in available_sources:
-            self.logger.error(f"Invalid data_source '{data_source}'")
-            raise ValueError(f"Invalid data_source '{data_source}'. Choose from: {available_sources}")
+        data_source = self._check_choice("data_source", data_source, DataSource)
 
         # Publish AF validation
         if not isinstance(publish_af, bool):
@@ -985,10 +984,7 @@ class InseasonScoreExtractor(BaseExtractor):
             raise ValueError(f"Invalid publish_af={publish_af}. Must be True or False.")
 
         # Detail level validation
-        valid_detail_levels = ["summary", "full"]
-        if detail_level not in valid_detail_levels:
-            self.logger.error(f"Invalid detail_level '{detail_level}'")
-            raise ValueError(f"Invalid detail_level='{detail_level}'. Choose from: {valid_detail_levels}")
+        detail_level = self._check_choice("detail_level", detail_level, DetailLevel)
 
         self.apply_cache_setting(use_cache)
 
@@ -1206,7 +1202,7 @@ class InseasonScoreExtractor(BaseExtractor):
             return {"success": False, "data": None, "error": str(e), "seasonfield_id": entity_id}
 
     @require_inseason_score_params
-    def format_inseason_score_json(self, response_inseason_score_json, params=None, detail_level="full"):
+    def format_inseason_score_json(self, response_inseason_score_json, params=None, detail_level: DetailLevel = "full"):
         """
         Normalize inseason_score API response into a clean pandas DataFrame.
 
@@ -1229,10 +1225,7 @@ class InseasonScoreExtractor(BaseExtractor):
         self.logger.debug(f"Entity {entity_id}: Formatting JSON response with detail_level='{detail_level}'")
 
         # Validate detail_level
-        valid_levels = ["summary", "full"]
-        if detail_level not in valid_levels:
-            self.logger.error(f"Invalid detail_level '{detail_level}'")
-            raise ValueError(f"Invalid detail_level='{detail_level}'. Choose from: {valid_levels}")
+        detail_level = self._check_choice("detail_level", detail_level, DetailLevel)
 
         if not isinstance(response_inseason_score_json, dict):
             self.logger.error(f"Entity {entity_id}: Response is not a dictionary")
@@ -1364,13 +1357,14 @@ class InseasonScoreExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="inseason_score",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of inseason_score requests using threads + progress bar,
         with optional fail-safe retry, filter capabilities, and caching.
@@ -1392,12 +1386,16 @@ class InseasonScoreExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "inseason_score".
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics.
                   When cache is active, also includes cache_hit and cache_miss counts.
         """
         # Route through cache wrapper if caching is enabled
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
             return self._bulk_with_cache(
@@ -1450,7 +1448,7 @@ class InseasonScoreExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="inseason_score",
         generate_report=False,
@@ -1468,10 +1466,7 @@ class InseasonScoreExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            self.logger.error(f"Invalid merge_existing='{merge_existing}'")
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         self.logger.debug(f"Merge mode: {merge_existing}")
 
@@ -1504,12 +1499,12 @@ class InseasonScoreExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_inseason_score)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             self.logger.debug(f"ThreadPoolExecutor started with {max_workers} workers")
             future_to_id = {
-                executor.submit(self.process_single_entity_inseason_score, row, params): self.get_entity_value(
-                    row, "id"
-                )
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

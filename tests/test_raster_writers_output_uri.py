@@ -4,7 +4,7 @@ Covers ``BaseExtractor.save_map_file`` and the three writers that call it
 (FLM, Difference, Zoning), which previously used ``open(..., "wb")`` directly
 and so could only ever write to a local directory.
 
-Two behaviours matter here:
+Two behaviors matter here:
 
 * ``save_path`` may be a remote URI — an ``s3://`` prefix must reach fsspec,
   not become a literal ``./s3:/bucket/...`` directory.
@@ -216,7 +216,7 @@ class TestWritersMirrorToOutputUri:
     def test_local_only_writes_nothing_remote(
         self, configured_difference_extractor, sample_difference_entity, tmp_path, fake_fsspec
     ):
-        """Default behaviour is unchanged: no output_uri, no remote traffic."""
+        """Default behavior is unchanged: no output_uri, no remote traffic."""
         ext = configured_difference_extractor
         ext.difference_params["map_format"] = "png"
         ext.output_uri = None

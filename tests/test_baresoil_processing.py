@@ -299,7 +299,7 @@ class TestProcessSingleEntityBaresoilExtras:
 
 
 class TestBulkBaresoilFilterType:
-    """Bulk filter_type behaviour — parity with the other suites."""
+    """Bulk filter_type behavior — parity with the other suites."""
 
     @patch("earthdaily.agriculture.processors.processor_baresoil_function.export_results")
     @patch.object(BaresoilExtractor, "process_single_entity_baresoil")

@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from io import BytesIO
+from typing import Literal
 from zipfile import ZipFile
 
 import pandas as pd
@@ -21,8 +22,20 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
+
+# Allowed values: one list each, read by the validator (BaseExtractor._check_choice)
+# and by generate_ai_context. Declared here, never repeated in a docstring.
+FlmVegetationIndex = Literal[
+    "NDVI", "EVI", "CVI", "CVIN", "GNDVI", "LAI", "NDWI", "NDMI", "S2REP", "COLORCOMPOSITION", "NDRE"
+]
+FlmMapFormat = Literal["png", "tiff", "tiff.zip", "shp.zip", None]
+FlmPostprocess = Literal["file", "stats", "links", "histogram"]
+FlmClipping = Literal["FieldBorder", "Bbox"]
+FlmLegendType = Literal["Fixed", "Dynamic", "Common"]
 
 
 def require_flm_params(func):
@@ -49,20 +62,23 @@ class FLMExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Field%20Level%20Maps/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_FLM_extraction_functions.ipynb
+    OpenAPI: https://api.geosys-na.net/field-level-maps/v5/swagger/v1/swagger.json
+    Operation: POST /maps/base-reference-map/{mapType}
+    Operation: POST /maps/base-reference-map/COLORCOMPOSITION
 
     Args (setup_flm_parameters):
-        vegetation_index (str): Index type ('NDVI', 'EVI', 'NDRE', etc.). Default: 'NDVI'
-        map_format (str): Output format (None, 'png', 'tiff', 'tiff.zip', 'shp.zip'). Default: None
+        vegetation_index (FlmVegetationIndex): Index the map is computed for. Default: 'NDVI'
+        map_format (FlmMapFormat): Output file format. Default: None
         output_epsg (int): Output coordinate system. Default: 4326
-        postprocess (str): Post-processing mode ('stats', 'links', 'file', 'histogram'). Default: 'stats'
+        postprocess (FlmPostprocess): What to return: map statistics, download links, files on disk, or a value histogram. Default: 'stats'
             'histogram' sets histogram=true on the query and returns the per-bucket
             breakdown as well as the global min/max/mean.
         extract_stats (bool): Extract map statistics. Default: False
         directLinks (bool): Return direct download links. Default: False
-        clipping (str): Clipping mode ('FieldBorder', 'None'). Default: 'FieldBorder'
+        clipping (FlmClipping): Clipping mode: the field border or its bounding box. Default: 'FieldBorder'
         buffer (int): Buffer around field border in meters. Default: 0
         number_bins (int): Number of legend bins for the rendered map. Default: None
-        legendType (str): Legend style for the rendered map. Default: None
+        legendType (FlmLegendType): Legend style for the rendered map. Default: None
         use_cache (bool): Reuse cached API responses and cache new results to avoid re-fetching. None uses the extractor's instance default. Default: None
 
     Entity fields (via column_mapping):
@@ -99,29 +115,29 @@ class FLMExtractor(BaseExtractor):
 
     def setup_flm_parameters(
         self,
-        vegetation_index="NDVI",
-        map_format=None,
+        vegetation_index: FlmVegetationIndex = "NDVI",
+        map_format: FlmMapFormat = None,
         output_epsg=4326,
-        postprocess="stats",
+        postprocess: FlmPostprocess = "stats",
         skip_existing=True,
         output_path=None,
         extract_stats=False,
         partial_frequency=50,
         directLinks=False,
-        clipping="FieldBorder",
+        clipping: FlmClipping = "FieldBorder",
         buffer=0,
         number_bins=None,
-        legendType=None,
+        legendType: FlmLegendType | None = None,
         use_cache=None,
     ):
         """
         Configure parameters for FLM extraction
 
         Args:
-            vegetation_index (str): Vegetation index to extract
-            map_format (str): Format of the map ('png', 'tiff', 'tiff.zip', 'shp.zip')
+            vegetation_index (FlmVegetationIndex): Vegetation index to extract
+            map_format (FlmMapFormat): Format of the map file
             output_epsg (int): Output EPSG code for projection
-            postprocess (str): Post-processing type - 'stats', 'file', 'links', or 'histogram'. Default: 'stats'
+            postprocess (FlmPostprocess): Post-processing type. Default: 'stats'
             skip_existing (bool): With postprocess='file', skip the API call when the output
                 file for an entity/image is already in output_path (non-empty). Lets a crashed
                 bulk run resume without re-downloading. Default: True
@@ -130,13 +146,13 @@ class FLMExtractor(BaseExtractor):
             partial_frequency (int): How often to save partial results
             directLinks (bool): Whether to use direct links in API response. Default: False
                             Note: Automatically set to True when postprocess='links'
-            clipping (str): Clipping method - 'FieldBorder' or 'Bbox'. Default: 'FieldBorder'
+            clipping (FlmClipping): Clipping method. Default: 'FieldBorder'
                         Note: Only applicable for COLORCOMPOSITION vegetation index
             buffer (int): Buffer distance in meters around geometry. Default: 0
             number_bins (int, optional): Number of histogram bins (1-255). When set,
                 appends ``&numberOfBins=<value>`` to the API URL. Default: None
                 (API uses its built-in default).
-            legendType (str, optional): Legend type - one of 'Fixed', 'Dynamic', 'Common'.
+            legendType (FlmLegendType, optional): Legend type.
                 When set, appends ``&legendType=<value>`` to the API URL. Default: None
                 (API uses 'Dynamic').
         """
@@ -144,37 +160,13 @@ class FLMExtractor(BaseExtractor):
         log.info("Configuring FLM parameters...")
 
         # Vegetation index validation
-        valid_indexes = {
-            "NDVI",
-            "EVI",
-            "CVI",
-            "CVIN",
-            "GNDVI",
-            "LAI",
-            "NDWI",
-            "NDMI",
-            "S2REP",
-            "COLORCOMPOSITION",
-            "NDRE",
-        }
-        if vegetation_index not in valid_indexes:
-            error_msg = f"Invalid vegetation_index '{vegetation_index}'. Must be one of {valid_indexes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        vegetation_index = self._check_choice("vegetation_index", vegetation_index, FlmVegetationIndex)
 
         # Map format validation
-        valid_formats = {"png", "tiff", "tiff.zip", "shp.zip", None}
-        if map_format not in valid_formats:
-            error_msg = f"Invalid map_format '{map_format}'. Must be one of {valid_formats}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        map_format = self._check_choice("map_format", map_format, FlmMapFormat)
 
         # Postprocess validation
-        valid_postprocess = {"file", "stats", "links", "histogram"}
-        if postprocess not in valid_postprocess:
-            error_msg = f"Invalid postprocess '{postprocess}'. Must be one of {valid_postprocess}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        postprocess = self._check_choice("postprocess", postprocess, FlmPostprocess)
 
         # DirectLinks validation
         if not isinstance(directLinks, bool):
@@ -183,11 +175,7 @@ class FLMExtractor(BaseExtractor):
             raise ValueError(error_msg)
 
         # Clipping validation
-        valid_clipping = {"FieldBorder", "Bbox"}
-        if clipping not in valid_clipping:
-            error_msg = f"Invalid clipping '{clipping}'. Must be one of {valid_clipping}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        clipping = self._check_choice("clipping", clipping, FlmClipping)
 
         # Buffer validation
         if not isinstance(buffer, (int, float)):
@@ -213,11 +201,7 @@ class FLMExtractor(BaseExtractor):
 
         # legendType validation (optional: one of 'Fixed', 'Dynamic', 'Common')
         if legendType is not None:
-            valid_legend_types = {"Fixed", "Dynamic", "Common"}
-            if legendType not in valid_legend_types:
-                error_msg = f"Invalid legendType '{legendType}'. Must be one of {valid_legend_types}."
-                log.error(error_msg)
-                raise ValueError(error_msg)
+            legendType = self._check_choice("legendType", legendType, FlmLegendType)
 
         # ✅ Cross-validation: postprocess='links' requirements
         if postprocess == "links":
@@ -934,13 +918,14 @@ class FLMExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="flm",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of entity FLM maps using threads + progress bar,
         with optional fail-safe retry and filter capabilities.
@@ -962,10 +947,14 @@ class FLMExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "flm".
             use_cache (bool, optional): Enable/disable caching for this call.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics.
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache is not None and use_cache:
             return self._bulk_with_cache(
                 bulk_method=self._process_entity_flm_bulk_parallel_inner,
@@ -1015,7 +1004,7 @@ class FLMExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="flm",
         generate_report=False,
@@ -1040,11 +1029,7 @@ class FLMExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -1077,9 +1062,11 @@ class FLMExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_flm)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_flm, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

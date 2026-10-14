@@ -21,11 +21,12 @@ from earthdaily.agriculture.core.api_utils import (
     safe_parse_date,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import DataSource, MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
 available_crops = {"CORN", "SECOND CORN", "SOYBEANS", "SUGARCANE", "COTTON", "OTHERS"}
-available_data_sources = {"LR", "MR"}
 
 
 def require_greenness_params(func):
@@ -51,6 +52,8 @@ class GreennessExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/greenness/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_greenness.ipynb
+    OpenAPI: https://zn6hzsqoyoe3qgaoau4ssgpq440vtmpa.lambda-url.us-east-1.on.aws/openapi.json
+    Operation: POST /greenness-detection
 
     Args (setup_greenness_parameters):
         season_duration (int): Season length in days. Default: 120
@@ -58,14 +61,14 @@ class GreennessExtractor(BaseExtractor):
         season_start_month (int): Season start month. Default: 4
         year (int): Target year. Default: 2025
         sowing_date (str): Sowing date in YYYY-MM-DD format. Default: '2025-04-01'
-        data_source (str): Data source ('LR', 'MR'). Default: 'LR'
+        data_source (DataSource): Imagery resolution: low (LR) or medium (MR). Default: 'LR'
         use_cache (bool): Reuse cached API responses and cache new results to avoid re-fetching. None uses the extractor's instance default. Default: None
 
     Entity fields (via column_mapping):
         id, geometry (required); crop, sowing_date (optional)
 
     Output columns:
-        entity_id, greenness_date, confidence, status, + detection metadata
+        entity_id, greenness_date, status, greenness_score, score, potential_score, label, date
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -123,7 +126,7 @@ class GreennessExtractor(BaseExtractor):
         season_start_month=4,
         year=2025,
         sowing_date="2025-04-01",
-        data_source="LR",
+        data_source: DataSource = "LR",
         publish_af=False,
         partial_frequency=50,
         column_mapping=None,
@@ -141,7 +144,7 @@ class GreennessExtractor(BaseExtractor):
             season_start_month (int): Crop cycle start month (1-12)
             year (int): Year to analyze
             sowing_date (str): Sowing date in YYYY-MM-DD format
-            data_source (str): Imagery type - 'LR' (low resolution) or 'MR' (medium resolution)
+            data_source (DataSource): Imagery resolution: low (LR) or medium (MR)
             publish_af (bool): Whether to publish to AF (includes id in payload if True). Default: False
             partial_frequency (int): How often to save partial results
         """
@@ -161,10 +164,7 @@ class GreennessExtractor(BaseExtractor):
             raise ValueError(error_msg)
 
         # Data source validation
-        if data_source not in available_data_sources:
-            error_msg = f"Invalid data_source '{data_source}'. Choose from: {available_data_sources}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        data_source = self._check_choice("data_source", data_source, DataSource)
 
         # Sowing date validation
         if not sowing_date or not isinstance(sowing_date, str):
@@ -501,13 +501,14 @@ class GreennessExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="greenness",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of greenness requests using threads + progress bar,
         with optional fail-safe retry, partial save capabilities, and caching.
@@ -529,6 +530,9 @@ class GreennessExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "greenness".
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict:
@@ -543,6 +547,7 @@ class GreennessExtractor(BaseExtractor):
                 }
         """
         # Route through cache wrapper if caching is enabled
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
             return self._bulk_with_cache(
@@ -595,7 +600,7 @@ class GreennessExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="greenness",
         generate_report=False,
@@ -617,11 +622,7 @@ class GreennessExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -654,9 +655,11 @@ class GreennessExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_greenness)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_greenness, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

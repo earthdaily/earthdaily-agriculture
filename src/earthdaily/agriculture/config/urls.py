@@ -4,6 +4,7 @@
 - `location_based_border_url`: the AutomaticBoundary endpoint (`/field-borders/v1/AutomaticBoundary`) used by `LocationBasedBorderExtractor` to derive a polygon from a point WKT.
 - `crop_id_url`: url to fetch crop information for a given geometry
 - `change_index_url`: url for change index calculations between NDVI images
+- `weatherflow_urls`: WeatherFlow weather API (X-API-Key auth), used by `WeatherFlowExtractor`
 """
 
 agro_urls = {
@@ -133,6 +134,13 @@ agro_urls = {
     "standing_crop_url": {
         "preprod": "https://standing-crop.aws-dev.geosys.com/v1",
         "prod": "https://standing-crop.aws-dev.geosys.com/v1",
+    },
+    # WeatherFlow: the new weather service (extractors/weatherflow_functions.py). Auth is an
+    # X-API-Key header, not the Geosys token. The /prod and /dev path IS part of the base URL
+    # (the OpenAPI documents' `servers`).
+    "weatherflow_urls": {
+        "preprod": "https://weatherflow.aws-dev.geosys.com/dev",
+        "prod": "https://weatherflow.aws.geosys.com/prod",
     },
     "history_url": {
         "preprod": "https://api-pp.geosys-na.net/accounts/history/v1",

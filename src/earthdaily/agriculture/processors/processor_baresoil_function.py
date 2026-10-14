@@ -3,6 +3,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
+from typing import Literal
 
 import pandas as pd
 
@@ -19,8 +20,14 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
+
+# Allowed values: one list each, read by the validator (BaseExtractor._check_choice)
+# and by generate_ai_context. Declared here, never repeated in a docstring.
+BaresoilFilter = Literal["summary", "full"]
 
 
 def require_baresoil_params(func):
@@ -46,20 +53,25 @@ class BaresoilExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/baresoil/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_baresoil.ipynb
+    OpenAPI: https://avuqeoz2lrpi2s5qovww5k4vca0itlyy.lambda-url.us-east-1.on.aws/v1/openapi.json
+    Operation: POST /launch
 
     Args (setup_baresoil_parameters):
         season_duration (int): Season length in days. Default: 120
         season_start_day (int): Season start day of month. Default: 1
         season_start_month (int): Season start month. Default: 4
         year (int): Target year. Default: 2025
-        filter (str): Output mode ('summary' or 'full'). Default: 'summary'
+        filter (BaresoilFilter): Output detail: one summary row per field, or the full series. Default: 'summary'
         use_cache (bool): Reuse cached API responses and cache new results to avoid re-fetching. None uses the extractor's instance default. Default: None
 
     Entity fields (via column_mapping):
         id, geometry (required)
 
     Output columns:
-        entity_id, bare_soil_days, + baresoil detection metrics
+        Varies by filter.
+        entity_id, year, season_start_month, season_start_day, season_duration,
+        has_baresoil, baresoil_days, baresoil_days_total, period_number, period_start, period_end,
+        period_length
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -88,7 +100,7 @@ class BaresoilExtractor(BaseExtractor):
         season_start_day=1,
         season_start_month=4,
         year=2025,
-        filter="summary",
+        filter: BaresoilFilter = "summary",
         publish_af=False,
         partial_frequency=50,
         column_mapping=None,
@@ -124,11 +136,7 @@ class BaresoilExtractor(BaseExtractor):
             raise ValueError(error_msg)
 
         # Filter for response processing
-        valid_filters = {"summary", "full"}
-        if filter not in valid_filters:
-            error_msg = f"Invalid filter='{filter}'. Must be 'summary' or 'full'."
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        filter = self._check_choice("filter", filter, BaresoilFilter)
 
         # Publish AF validation
         if not isinstance(publish_af, bool):
@@ -488,13 +496,14 @@ class BaresoilExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="baresoil",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of baresoil requests using threads + progress bar,
         with optional fail-safe retry, filter capabilities, and caching.
@@ -516,12 +525,16 @@ class BaresoilExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "baresoil".
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics.
                   When cache is active, also includes cache_hit and cache_miss counts.
         """
         # Route through cache wrapper if caching is enabled
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
             return self._bulk_with_cache(
@@ -574,7 +587,7 @@ class BaresoilExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="baresoil",
         generate_report=False,
@@ -596,11 +609,7 @@ class BaresoilExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -633,9 +642,11 @@ class BaresoilExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_baresoil)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_baresoil, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

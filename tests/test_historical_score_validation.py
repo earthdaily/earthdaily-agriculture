@@ -70,7 +70,7 @@ class TestValidateHistoricalSeasons:
         assert validate_historical_seasons([2024, 2023, 2022]) == [2024, 2023, 2022]
 
     def test_comma_separated_string_normalized_to_list(self):
-        """Pipeline-flattened string '2024,2023,2022' should normalise back to a list of ints."""
+        """Pipeline-flattened string '2024,2023,2022' should normalize back to a list of ints."""
         assert validate_historical_seasons("2024,2023,2022") == [2024, 2023, 2022]
 
     def test_int_lookback_rejected(self):

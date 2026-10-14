@@ -3,6 +3,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
+from typing import Literal
 
 import pandas as pd
 
@@ -22,10 +23,12 @@ from earthdaily.agriculture.core.api_utils import (
     safe_parse_date,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import DataSource, MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
-available_type = {"INSEASON", "HISTORICAL", "DELAY"}
+EmergenceType = Literal["INSEASON", "HISTORICAL", "DELAY"]
 available_crops = {"CORN", "SECOND CORN", "SOYBEANS", "SUGARCANE", "COTTON", "OTHERS"}
 
 
@@ -54,15 +57,16 @@ class EmergenceExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Emergence/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook:      EDAgriculture_Emergence_Processor_Function_Dev.ipynb
-    API endpoint:  {agro_urls["emergence_url"][env]}/... (env-dependent)
+    OpenAPI:       https://emergence-detection.aws.geosys.com/openapi.json
+    Operation:     POST /launch
 
     Args (setup_emergence_parameters):
-        emergence_type (str): Detection type ('INSEASON', 'HISTORICAL', 'DELAY'). Default: 'INSEASON'
+        emergence_type (EmergenceType): Detection type. Default: 'INSEASON'
         season_duration (int): Season length in days. Default: 120
         season_start_day (int): Season start day of month. Default: 1
         season_start_month (int): Season start month. Default: 4
         year (int): Target year. Default: 2025
-        data_source (str): Data source ('LR', 'MR'). Default: 'LR'
+        data_source (DataSource): Imagery resolution: low (LR) or medium (MR). Default: 'LR'
         use_cache (bool): Reuse cached API responses and cache new results to avoid re-fetching. None uses the extractor's instance default. Default: None
 
     For HISTORICAL, a per-field ``historical_seasons`` input (via column_mapping) lists the
@@ -77,7 +81,10 @@ class EmergenceExtractor(BaseExtractor):
         sowing_date is NOT read: the season window comes from setup.
 
     Output columns:
-        entity_id, emergence_date, confidence, status, emergence_year_1..5, historical_average_emergence, avg_emergence_matching_years (MM-DD)
+        Varies by emergence_type.
+        entity_id, emergence_date, emergence_status, confirmation_status,
+        emergence_delay, average_emergence_date, historical_average_emergence, emergence_year_1..5,
+        avg_emergence_matching_years (MM-DD)
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -132,12 +139,12 @@ class EmergenceExtractor(BaseExtractor):
 
     def setup_emergence_parameters(
         self,
-        emergence_type="INSEASON",
+        emergence_type: EmergenceType = "INSEASON",
         season_duration=120,
         season_start_day=1,
         season_start_month=4,
         year=2025,
-        data_source="LR",
+        data_source: DataSource = "LR",
         publish_af=False,
         partial_frequency=50,
         column_mapping=None,
@@ -150,12 +157,12 @@ class EmergenceExtractor(BaseExtractor):
         Configure parameters for Emergence extraction
 
         Args:
-            emergence_type (str): Selection between INSEASON, HISTORICAL or DELAY
+            emergence_type (EmergenceType): Detection type
             season_duration (int): Crop cycle duration in days
             season_start_day (int): Crop cycle start day (1-31)
             season_start_month (int): Crop cycle start month (1-12)
             year (int): Year to analyze
-            data_source (str): Imagery type - 'LR' (low resolution) or 'MR' (medium resolution)
+            data_source (DataSource): Imagery resolution: low (LR) or medium (MR)
             publish_af (bool): Whether to publish to AF (includes id in payload if True). Default: False
             partial_frequency (int): How often to save partial results
         """
@@ -163,10 +170,7 @@ class EmergenceExtractor(BaseExtractor):
         log.info("Configuring emergence parameters...")
 
         # Emergence type validation
-        if emergence_type not in available_type:
-            error_msg = f"Invalid emergence type '{emergence_type}'. Choose from: {available_type}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        emergence_type = self._check_choice("emergence_type", emergence_type, EmergenceType)
 
         # Month validation
         if not (1 <= season_start_month <= 12):
@@ -181,11 +185,7 @@ class EmergenceExtractor(BaseExtractor):
             raise ValueError(error_msg)
 
         # Data source validation
-        available_sources = {"LR", "MR"}
-        if data_source not in available_sources:
-            error_msg = f"Invalid data_source '{data_source}'. Choose from: {available_sources}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        data_source = self._check_choice("data_source", data_source, DataSource)
 
         # Publish AF validation
         if not isinstance(publish_af, bool):
@@ -585,13 +585,14 @@ class EmergenceExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="emergence",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of emergence requests using threads + progress bar,
         with optional fail-safe retry, partial save capabilities, and caching.
@@ -613,6 +614,9 @@ class EmergenceExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "emergence".
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict:
@@ -627,6 +631,7 @@ class EmergenceExtractor(BaseExtractor):
                 }
         """
         # Route through cache wrapper if caching is enabled
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
             return self._bulk_with_cache(
@@ -679,7 +684,7 @@ class EmergenceExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="emergence",
         generate_report=False,
@@ -701,11 +706,7 @@ class EmergenceExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -738,9 +739,11 @@ class EmergenceExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_emergence)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_emergence, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

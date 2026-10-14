@@ -18,7 +18,7 @@ Strategy: bypass ``WorkflowManager.__init__`` for runner tests (same pattern as
 the existing test file). For ``__init__`` itself, mock the auth/S3/env dependencies.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pandas as pd
 import pytest
@@ -196,8 +196,9 @@ class TestWorkflowManagerInit:
         assert wm.step_map is None
         assert wm.workflow_results == {}
         assert wm.sfd_list is None
-        # S3 init was attempted on the authenticator instance
-        mock_auth_instance.initialize_s3_client.assert_called_once()
+        # #108: no S3 setup at init; the client is built on first use
+        mock_auth_instance.initialize_s3_client.assert_not_called()
+        mock_auth_instance.ensure_s3_client.assert_not_called()
 
     @patch("earthdaily.agriculture.services.workflow_manager.setup_logging")
     @patch("earthdaily.agriculture.services.workflow_manager.EDAuthenticator")
@@ -495,7 +496,7 @@ class TestWorkflowManagerInit:
     def test_init_storage_auto_is_the_default_and_honours_env(
         self, mock_setup_env, mock_authenticator, mock_setup_logging, monkeypatch
     ):
-        """storage='auto' (the default) keeps the env-var-respecting behaviour."""
+        """storage='auto' (the default) keeps the env-var-respecting behavior."""
         mock_setup_env.return_value = {
             "env": "preprod",
             "project_root": "/proj",
@@ -537,7 +538,7 @@ class TestWorkflowManagerInit:
     @patch("earthdaily.agriculture.services.workflow_manager.EDAuthenticator")
     @patch("earthdaily.agriculture.services.workflow_manager.setup_environment")
     def test_init_tolerates_s3_init_failure(self, mock_setup_env, mock_authenticator, mock_setup_logging):
-        """If S3 client init raises, init still succeeds (S3 is optional)."""
+        """Init never touches S3 (#108): any S3 access during init fails this test."""
         mock_setup_env.return_value = {
             "env": "preprod",
             "project_root": "/proj",
@@ -548,10 +549,13 @@ class TestWorkflowManagerInit:
         mock_auth_instance = MagicMock()
         mock_auth_instance.bearer_token = "tok"
         mock_auth_instance.expiration_date = None
-        mock_auth_instance.initialize_s3_client.side_effect = RuntimeError("no aws creds")
+        no_creds = RuntimeError("no aws creds")
+        mock_auth_instance.initialize_s3_client.side_effect = no_creds
+        mock_auth_instance.ensure_s3_client.side_effect = no_creds
+        type(mock_auth_instance).s3_client = PropertyMock(side_effect=no_creds)
         mock_authenticator.return_value = mock_auth_instance
 
-        # Should NOT raise
+        # Should NOT raise: nothing S3-related runs at init
         wm = WorkflowManager(env="preprod")
         assert wm.env == "preprod"
 
@@ -867,7 +871,7 @@ class TestRunWorkflowGenerateReport:
     """
 
     def test_generate_report_false_does_not_build_reporter(self, manager, tmp_path, entities):
-        """Default behaviour: byte-identical to pre-Phase-2 except for the
+        """Default behavior: byte-identical to pre-Phase-2 except for the
         new ``last_run_reporter`` attribute being set to None."""
         cfg = {"name": "test", "steps": [_passthrough_step("solo")]}
         manager.load_workflow(_write_yaml(tmp_path, cfg))
@@ -961,7 +965,7 @@ class TestRunWorkflowGenerateReport:
     def test_report_options_split_between_constructor_and_context(self, manager, tmp_path, entities):
         """report_options accepts both reporter-constructor knobs and
         run-context fields. Constructor kwargs change the reporter's
-        behaviour; context kwargs end up in the rendered JSON."""
+        behavior; context kwargs end up in the rendered JSON."""
         manager.env = "preprod"
         cfg = {"name": "t", "steps": [_passthrough_step("solo")]}
         manager.load_workflow(_write_yaml(tmp_path, cfg))
@@ -1552,7 +1556,7 @@ class TestRunWorkflowDisabledSteps:
         assert manager.step_map["a"]["enabled"] is True
 
     def test_disabled_steps_cascade_to_downstream(self, manager, tmp_path, entities):
-        """Same cascade-skip behaviour as YAML-level enabled=false."""
+        """Same cascade-skip behavior as YAML-level enabled=false."""
         cfg = {
             "name": "cascade-headless",
             "steps": [

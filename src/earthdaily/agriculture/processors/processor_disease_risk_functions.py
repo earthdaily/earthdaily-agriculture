@@ -22,8 +22,10 @@ from earthdaily.agriculture.core.api_utils import (
     validate_kpi_filter,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
 
 def require_disease_params(func):
@@ -49,6 +51,8 @@ class DiseaseExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_disease.ipynb
+    OpenAPI: https://t7izeqf7q5t4xseagqap5ev7xm0xpmmh.lambda-url.us-east-1.on.aws/v1/openapi.json
+    Operation: POST /launch
 
     Args (setup_disease_parameters):
         start_date (str): Start date in YYYY-MM-DD format. Default: None
@@ -554,13 +558,14 @@ class DiseaseExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="disease",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of entity disease data using threads + progress bar,
         with optional fail-safe retry and filter capabilities.
@@ -579,10 +584,14 @@ class DiseaseExtractor(BaseExtractor):
             skip_export (bool): If True, skip final export
             prefix (str): Prefix for output filenames
             use_cache (bool, optional): Enable/disable caching for this call
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache is not None and use_cache:
             return self._bulk_with_cache(
                 bulk_method=self._process_entity_disease_bulk_parallel_inner,
@@ -632,7 +641,7 @@ class DiseaseExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="disease",
         generate_report=False,
@@ -653,10 +662,7 @@ class DiseaseExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            self.logger.error(f"Invalid merge_existing='{merge_existing}'")
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         self.logger.debug(f"Merge mode: {merge_existing}")
 
@@ -691,10 +697,12 @@ class DiseaseExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_disease)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             self.logger.debug(f"ThreadPoolExecutor started with {max_workers} workers")
             future_to_id = {
-                executor.submit(self.process_single_entity_disease, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

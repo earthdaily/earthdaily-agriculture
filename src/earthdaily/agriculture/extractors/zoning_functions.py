@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from io import BytesIO
+from typing import Literal
 from zipfile import ZipFile
 
 import pandas as pd
@@ -21,8 +22,15 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
+
+# Allowed values: one list each, read by the validator (BaseExtractor._check_choice)
+# and by generate_ai_context. Declared here, never repeated in a docstring.
+ZoningPostprocess = Literal["stats", "stats_geo", "links", "file"]
+ZoningMapFormat = Literal["png", "tiff.zip", "shp.zip", None]
 
 
 def require_zoning_params(func):
@@ -49,14 +57,16 @@ class ZoningExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Field%20Level%20Maps/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_zoning.ipynb
+    OpenAPI: https://api.geosys-na.net/field-level-maps/v5/swagger/v1/swagger.json
+    Operation: POST /maps/management-zones-map/{mapType}
 
     Args (setup_zoning_parameters):
         num_zones (int): Number of management zones to generate. Default: 5
         output_epsg (int): Output coordinate system. Default: 4326
-        postprocess (str): Processing mode - 'stats', 'stats_geo', 'links', or 'file'. Default: 'stats'
+        postprocess (ZoningPostprocess): What to return: zone statistics (with geometries for 'stats_geo'), download links, or files on disk. Default: 'stats'
             'stats' returns one field-level row; 'stats_geo' returns one row *per zone*,
             carrying that zone's geometry alongside the field-level stats.
-        map_format (str): Output format for file mode ('png', 'tiff.zip', 'shp.zip'). Default: None
+        map_format (ZoningMapFormat): Output file format, used with postprocess='file'. Default: None
         output_path (str): Directory for file downloads. Default for postprocess='file': <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX.
         directLinks (bool): Request direct download links from API. Default: False
         partial_frequency (int): How often to save partial results. Default: 50
@@ -104,8 +114,8 @@ class ZoningExtractor(BaseExtractor):
         self,
         num_zones=5,
         output_epsg=4326,
-        postprocess="stats",
-        map_format=None,
+        postprocess: ZoningPostprocess = "stats",
+        map_format: ZoningMapFormat = None,
         output_path=None,
         skip_existing=True,
         directLinks=False,
@@ -122,11 +132,11 @@ class ZoningExtractor(BaseExtractor):
         Args:
             num_zones (int): Number of management zones (2-10). Default: 5
             output_epsg (int): Output EPSG code for projection. Default: 4326
-            postprocess (str): Processing mode - 'stats', 'stats_geo', 'links', or 'file'. Default: 'stats'
+            postprocess (ZoningPostprocess): What to return: zone statistics (with geometries for 'stats_geo'), download links, or files on disk. Default: 'stats'
                 'stats' returns a single field-level row per entity. 'stats_geo' returns one
                 row per zone, adding the zone geometry (segments merged into a
                 GEOMETRYCOLLECTION when a zone has several) and its per-zone mean/max/min/area.
-            map_format (str): Output format for file mode ('png', 'tiff.zip', 'shp.zip'). Default: None
+            map_format (ZoningMapFormat): Output file format, used with postprocess='file'. Default: None
             output_path (str): Directory for file downloads. Default for postprocess='file': <results dir>/maps, which follows EDAGRO_OUTPUT_PREFIX.
             skip_existing (bool): Skip download if file already exists. Default: True
             directLinks (bool): Request direct download links. Default: False
@@ -148,18 +158,10 @@ class ZoningExtractor(BaseExtractor):
             raise ValueError(error_msg)
 
         # Postprocess validation
-        valid_postprocess = {"stats", "stats_geo", "links", "file"}
-        if postprocess not in valid_postprocess:
-            error_msg = f"Invalid postprocess '{postprocess}'. Must be one of {valid_postprocess}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        postprocess = self._check_choice("postprocess", postprocess, ZoningPostprocess)
 
         # Map format validation
-        valid_formats = {"png", "tiff.zip", "shp.zip", None}
-        if map_format not in valid_formats:
-            error_msg = f"Invalid map_format '{map_format}'. Must be one of {valid_formats}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        map_format = self._check_choice("map_format", map_format, ZoningMapFormat)
 
         # Cross-validation: postprocess='links' requirements
         if postprocess == "links":
@@ -801,13 +803,14 @@ class ZoningExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="zoning",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of entity SAMZ zones using threads + progress bar,
         with optional fail-safe retry and filter capabilities.
@@ -831,10 +834,14 @@ class ZoningExtractor(BaseExtractor):
             generate_report (bool, optional): Generate HTML report. Default: False.
             report_options (dict, optional): Report configuration options.
             use_cache (bool, optional): Enable/disable caching for this call.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics.
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache is not None and use_cache:
             return self._bulk_with_cache(
                 bulk_method=self._process_entity_zoning_bulk_parallel_inner,
@@ -884,7 +891,7 @@ class ZoningExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="zoning",
         generate_report=False,
@@ -908,11 +915,7 @@ class ZoningExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -945,9 +948,11 @@ class ZoningExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_zoning)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_zoning, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

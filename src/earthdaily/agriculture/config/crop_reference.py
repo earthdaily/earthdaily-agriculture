@@ -1,5 +1,5 @@
 """
-Crop catalogue — the platform-wide vocabulary of crop codes.
+Crop catalog — the platform-wide vocabulary of crop codes.
 
 Split out of ``config.reference_data`` because this half ships **publicly**: the
 field-ingestion path (``services.entity_management.prepare_field_dataframe``)
@@ -18,12 +18,12 @@ Like the rest of ``config/``, this holds data only: validation lives in
 Last updated: 2026-08-04
 """
 
-# Crop catalogue, captured from GET /crops on prod (2026-08-04).
+# Crop catalog, captured from GET /crops on prod (2026-08-04).
 #
 # `id == code` for every crop, exactly as for roles — so these keys are the ids
 # the API expects in `SeasonFieldDtoCreate.crop`, no lookup required.
 #
-# ⚠️ This is the PLATFORM-WIDE catalogue. The crops a given customer may
+# ⚠️ This is the PLATFORM-WIDE catalog. The crops a given customer may
 # actually use is a subset, exposed per customer as `CustomerDto.crops` and
 # configured when the customer is set up. Validate against the customer's own
 # list when one is available; this dict is the outer bound.

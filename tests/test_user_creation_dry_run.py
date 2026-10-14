@@ -3,7 +3,7 @@
 This is the test that matters. Everything else about a rehearsal is presentation;
 the one thing it must never do is write. If `dry_run` silently created users, the
 failure would be discovered on a real tenant, and back-office writes land on APIs
-with no transaction and — for some artefacts — no delete route.
+with no transaction and — for some artifacts — no delete route.
 
 So these assert on the transport: `requests.post` and `requests.patch` are
 patched at the module boundary and must not be called once. Reads are expected

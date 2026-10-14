@@ -2473,13 +2473,6 @@ def mrts_extractor(mock_logger):
     ext.use_cache = False
     ext.cache_key_columns = None
 
-    # Class-level enums normally set in MRTSExtractor.__init__
-    ext.available_indices = {"NDVI", "EVI", "CVI", "GNDVI", "NDWI", "LAI", "NDRE", "NDMI", "S2REP"}
-    ext.available_sensors = {"Sentinel_2", "Landsat_8", "Landsat_9", "HJ2B_CCD4", "GAOFEN_6_WFV3"}
-    ext.available_smoothing = {"Whittaker", "SavitzkyGolay", "None"}
-    ext.available_aggregation = {"average", "median", "max", "min", "accumulation", "std"}
-    ext.available_masks = {"native": "Native", "acm": "ACM", "auto": "Auto", "ml": "ML", "mlcirrus": "MLCirrus"}
-
     ext.vegetation_ts_params = None
     ext.mrts_params = None
     ext.mrts_url = FAKE_MRTS_URL

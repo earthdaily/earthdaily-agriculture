@@ -124,7 +124,7 @@ class TestSetupHarvestParameters:
         assert harvest_extractor.harvest_params["harvest_type"] == htype
 
     def test_invalid_harvest_type_raises(self, harvest_extractor):
-        with pytest.raises(ValueError, match="Invalid harvest type"):
+        with pytest.raises(ValueError, match="Invalid harvest_type"):
             harvest_extractor.setup_harvest_parameters(harvest_type="BOGUS")
 
     # --- month validation ---

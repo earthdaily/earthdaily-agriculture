@@ -72,7 +72,7 @@ TERMS_URL = "https://earthdaily.com/terms-of-use"
 PRIVACY_URL = "https://earthdaily.com/privacy-policy"
 FOOTER_LINKS = (("Documentation", DOCS_URL), ("Terms of use", TERMS_URL), ("Privacy policy", PRIVACY_URL))
 
-#: Packaged mark. The light-ground, full-colour asset, because the report renders
+#: Packaged mark. The light-ground, full-color asset, because the report renders
 #: on a light hero (§26: pick the asset for the ground it sits on). When the report
 #: grows a dark theme, the white-gradient asset joins it here.
 _LOGO_ASSET = "eda_logo_light.png"

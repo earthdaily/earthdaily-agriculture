@@ -31,7 +31,9 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
 
 def require_user_params(func):
@@ -56,6 +58,7 @@ class UserManager(BaseExtractor):
     parallel processing for performance.
 
     Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
+    OpenAPI: https://api.geosys-na.net/master-data-management/v6/swagger/v7.1/swagger.json
 
     Supported operations:
         - User creation (AGRONOMIST/GROWER) with automatic ordering
@@ -63,6 +66,14 @@ class UserManager(BaseExtractor):
         - Account linking (AGRONOMIST manages GROWER)
         - User modification (identified by ID) with link synchronization
         - User deletion with automatic link cleanup
+
+    Constraints:
+        - On a modify, email, login and userType are ALWAYS sent (defaulting to "", "" and
+          GROWER): leaving them out of the frame BLANKS them on the account. Carry them through
+          from the existing record. Every other field is omitted when absent.
+        - A row without a User_Type is created as a GROWER.
+        - create_users() creates AGRONOMIST rows before GROWER rows, so a grower can be linked to
+          an agronomist created in the same call.
     """
 
     MAX_WORKERS = 10
@@ -516,7 +527,7 @@ class UserManager(BaseExtractor):
 
     def format_user_json(self, response_json, entity_data=None):
         """
-        Normalise a single user record (from ``get_user_by_id``) into a one-row
+        Normalize a single user record (from ``get_user_by_id``) into a one-row
         DataFrame, flattening nested objects (``userType.code``, ``country.code``, ...).
 
         Returns:
@@ -552,7 +563,7 @@ class UserManager(BaseExtractor):
         if params is None:
             params = self.user_params
 
-        # Normalise row to dict
+        # Normalize row to dict
         try:
             if isinstance(row, pd.DataFrame):
                 if len(row) > 1:
@@ -614,13 +625,14 @@ class UserManager(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="users",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk user read with threading, partial saves, cache and merge logic.
 
@@ -632,7 +644,11 @@ class UserManager(BaseExtractor):
         Args:
             entity_list (pd.DataFrame): Entities whose mapped ``id`` column holds
                 the MDM user ids to fetch.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache is not None and use_cache:
             return self._bulk_with_cache(
                 bulk_method=self._process_entity_user_bulk_parallel_inner,
@@ -693,8 +709,7 @@ class UserManager(BaseExtractor):
 
         if merge_existing is None:
             merge_existing = self.merge_existing
-        if merge_existing not in ("auto", "preserve", "mark"):
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from ['auto','preserve','mark']")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         filtered, skipped, skip_count = filter_entities(entity_list, filter_column, filter_value, filter_type)
 
@@ -715,10 +730,11 @@ class UserManager(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_user)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_user, row, params): self.get_entity_value(row, "id")
-                for _, row in filtered.iterrows()
+                executor.submit(paced, row, params): self.get_entity_value(row, "id") for _, row in filtered.iterrows()
             }
 
             with tqdm(total=len(future_to_id), desc="👤 Fetching users", unit="entity") as pbar:

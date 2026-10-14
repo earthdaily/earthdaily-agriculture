@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
+from typing import Literal, get_args
 
 import pandas as pd
 
@@ -30,11 +31,13 @@ from earthdaily.agriculture.core.base_extractor import (
     cache_single_entity,
     requires_token,
 )
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import get_centroid_wkt, validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import SpatialBulkResult
 
-# Weather parameters available
-available_weather_parameters = {
+# Weather parameters the API serves; `weather_parameters` takes one, a list, or "none" (all).
+WeatherParameter = Literal[
     "cloudcover.min",
     "cloudcover",
     "cloudcover.max",
@@ -50,8 +53,9 @@ available_weather_parameters = {
     "Temperature.standard",
     "Temperature.standardmax",
     "wind",
-}
-available_weather_type = {"HISTORICAL_DAILY", "FORECAST_DAILY", "FORECAST_HOURLY"}
+]
+available_weather_parameters = set(get_args(WeatherParameter))  # the "none" expansion
+WeatherType = Literal["HISTORICAL_DAILY", "FORECAST_DAILY", "FORECAST_HOURLY"]
 
 
 def require_weather_params(func):
@@ -76,10 +80,12 @@ class WeatherExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_weather.ipynb
+    OpenAPI: https://api.geosys-na.net/Weather/v1/swagger/v2.0/swagger.json
+    Operation: GET /weather
 
     Args (setup_weather_parameters):
-        weather_type (str): Weather data type ('HISTORICAL_DAILY'). Default: 'HISTORICAL_DAILY'
-        weather_parameters (str|list): Parameters to retrieve; 'none' expands to all available parameters. Default: 'precipitation.cumulative'
+        weather_type (WeatherType): Historical or forecast data, daily or hourly. Default: 'HISTORICAL_DAILY'
+        weather_parameters (WeatherParameter | list[WeatherParameter]): Parameters to retrieve; 'none' expands to all available parameters. Default: 'precipitation.cumulative'
         kpi_filter (dict): KPI aggregation config (kpi_name, aggregation, threshold)
         historical_years (int): Number of prior years of weather history to fetch. Default: 0
         page_limit (int): Override the API row limit ($limit); by default it is auto-sized to the query span so multi-year ranges are not truncated. Default: None
@@ -118,8 +124,8 @@ class WeatherExtractor(BaseExtractor):
     @requires_token
     def setup_weather_parameters(
         self,
-        weather_type="HISTORICAL_DAILY",
-        weather_parameters="precipitation.cumulative",
+        weather_type: WeatherType = "HISTORICAL_DAILY",
+        weather_parameters: WeatherParameter | list[WeatherParameter] | Literal["none"] = "precipitation.cumulative",
         historical_years=0,
         partial_frequency=50,
         kpi_filter=None,
@@ -134,8 +140,8 @@ class WeatherExtractor(BaseExtractor):
         Configure params for weather extraction for an entity
 
         Args:
-            weather_type (str): Type of weather data (HISTORICAL_DAILY, FORECAST_DAILY, FORECAST_HOURLY)
-            weather_parameters (str or list): Weather parameters to extract. Defaults to
+            weather_type (WeatherType): Historical or forecast data, daily or hourly
+            weather_parameters (WeatherParameter | list[WeatherParameter]): Weather parameters to extract. Defaults to
                 'precipitation.cumulative'. Pass 'none' to retrieve every available parameter.
             historical_years (int or list): Number of historical years for KPI comparison, or list of specific years
             partial_frequency (int): How often to save partial results
@@ -147,9 +153,7 @@ class WeatherExtractor(BaseExtractor):
         """
         self.logger.info("Setting up weather parameters...")
 
-        if weather_type not in available_weather_type:
-            self.logger.error(f"Invalid weather type: {weather_type}")
-            raise ValueError(f"Invalid weather '{weather_type}'. Must be one of {available_weather_type}")
+        weather_type = self._check_choice("weather_type", weather_type, WeatherType)
 
         # Validate historical_years (int or list of ints, also accept comma-separated string)
         if isinstance(historical_years, str):
@@ -169,10 +173,7 @@ class WeatherExtractor(BaseExtractor):
         # Validate weather parameters — accepts string, list, or "none" (all params)
         if weather_parameters != "none":
             params_list = weather_parameters if isinstance(weather_parameters, list) else [weather_parameters]
-            invalid = [p for p in params_list if p not in available_weather_parameters]
-            if invalid:
-                self.logger.error(f"Invalid weather parameter(s): {invalid}")
-                raise ValueError(f"Invalid weather parameter(s) {invalid}. Must be from {available_weather_parameters}")
+            self._check_choices("weather_parameters", params_list, WeatherParameter)
 
         # Validate KPI filter (centralized rules — see api_utils.validate_kpi_filter)
         validate_kpi_filter(kpi_filter, logger=self.logger)
@@ -688,7 +689,7 @@ class WeatherExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="weather",
         generate_report=False,
@@ -697,7 +698,8 @@ class WeatherExtractor(BaseExtractor):
         spatial_grouping=False,
         spatial_precision=DEFAULT_SPATIAL_PRECISION,
         spatial_max_window_days=DEFAULT_MAX_WINDOW_DAYS,
-    ):
+        rate_limit=None,
+    ) -> SpatialBulkResult:
         """
         Bulk processing of entity weather data using threads + progress bar,
         with optional fail-safe retry and filter capabilities.
@@ -720,7 +722,7 @@ class WeatherExtractor(BaseExtractor):
                 historical_years``, call the API once per group over the *union* of
                 the group's date windows, and slice each member out of that single
                 response. Weather is queried by field centroid
-                (``Location=<centroid>``), so neighbouring fields return identical
+                (``Location=<centroid>``), so neighboring fields return identical
                 values and dedup safely; members are cut back to their own window, so
                 the output matches an ungrouped run row for row. Weather parameters are
                 all per-day — including ``precipitation.cumulative``, which despite its
@@ -735,10 +737,15 @@ class WeatherExtractor(BaseExtractor):
                 ``DEFAULT_MAX_WINDOW_DAYS``). Cells whose union exceeds it are split
                 into sub-groups, so one long-history field cannot force a decade-long
                 pull on every field sharing its cell.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics
         """
+
+        self._bulk_rate_limit = rate_limit  # read by _paced()
 
         def _dispatch(
             el, *, skip_export_=skip_export, generate_report_=generate_report, report_options_=report_options
@@ -836,7 +843,7 @@ class WeatherExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="weather",
         generate_report=False,
@@ -857,10 +864,7 @@ class WeatherExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            self.logger.error(f"Invalid merge_existing='{merge_existing}'")
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         self.logger.debug(f"Merge mode: {merge_existing}")
 
@@ -895,10 +899,12 @@ class WeatherExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_weather)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             self.logger.debug(f"ThreadPoolExecutor started with {max_workers} workers")
             future_to_id = {
-                executor.submit(self.process_single_entity_weather, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

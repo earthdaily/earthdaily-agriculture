@@ -15,7 +15,7 @@ provisioning, all confirmed against live captures:
 
 The last two were previously described here as "out of scope, owned by other
 surfaces". That was wrong for provisioning and is corrected: a cockpit built
-from ``FAVORITE_MAP_WIDGET`` entries is unusable without the favourites it
+from ``FAVORITE_MAP_WIDGET`` entries is unusable without the favorites it
 references by id, and an account with no active-view pointer opens on no view.
 Seeding an account writes all four.
 
@@ -158,6 +158,7 @@ class HistoryManager(BaseExtractor):
     """Manage per-user solution configuration via the History API.
 
     Documentation: https://api.geosys-na.net/accounts/history/v1/swagger
+    OpenAPI: https://api.geosys-na.net/accounts/history/v1/swagger/v1.0/swagger.json
 
     Supported operations:
         - List history entries with filters (``UserId`` / ``Type`` / ``ElementId`` / ``Id``)
@@ -166,6 +167,18 @@ class HistoryManager(BaseExtractor):
         - Create a new entry (POST — also used for "updates" since the API has no DELETE)
         - ``get_user_entry`` / ``save_user_entry`` convenience methods for the
           "one config per (user, type, element_id)" invariant
+
+    Constraints:
+        - Pass the user id you already have: every method translates MDM's legacy users.id
+          to externalIds.id, the only id the History API accepts (a raw call with the legacy
+          id gets a 404).
+        - Omitting user_id writes to the CALLING account, not to the user you meant.
+        - POST upserts on (user_id, type, element_id) and there is no DELETE: a row written
+          under a wrong element_id is a permanent orphan (verified on preprod 2026-08-05).
+        - COCKPIT_UNIQUEAPP_ACTIVE takes element_id='COCKPIT_UNIQUEAPP' (the layout's id, not
+          its own type name).
+        - Raw query filters are PascalCase (UserId, Type, ElementId, Id); the server ignores
+          unknown parameters, so the wrong form silently means no filter.
     """
 
     DEFAULT_LIMIT = 100

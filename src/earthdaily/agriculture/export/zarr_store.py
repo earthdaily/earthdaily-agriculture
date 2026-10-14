@@ -56,7 +56,7 @@ _JOIN_DEFAULTS = {
     frozenset(("date", "entity")): "outer",  # entity onboarding pads old dates NaN — intended
     frozenset(("time", "y", "x")): "exact",  # grid drift is corruption — raise, don't union
 }
-_FALLBACK_JOIN = "outer"  # unknown shapes: preserve the historical (implicit-outer) behaviour
+_FALLBACK_JOIN = "outer"  # unknown shapes: preserve the historical (implicit-outer) behavior
 
 
 class ZarrStore:
@@ -91,7 +91,7 @@ class ZarrStore:
         a ``(time,y,x)`` cube "must" carry ``field_mask``, so pass a domain check here: when it
         returns False the store is reported ABSENT (``None``), so the next ``write``/``append``
         rebuilds it instead of a torn store poisoning every later run. Default ``None`` keeps the
-        previous behaviour (return whatever is found).
+        previous behavior (return whatever is found).
         """
         import xarray as xr
 
@@ -107,7 +107,7 @@ class ZarrStore:
     # -- chunking ---------------------------------------------------------
     @staticmethod
     def default_chunks(ds) -> dict | None:
-        """Shape-aware chunk spec for ``ds`` (None if the shape isn't recognised)."""
+        """Shape-aware chunk spec for ``ds`` (None if the shape isn't recognized)."""
         return _CHUNK_DEFAULTS.get(frozenset(ds.dims))
 
     @staticmethod

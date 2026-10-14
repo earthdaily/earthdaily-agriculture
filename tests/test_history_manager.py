@@ -133,7 +133,7 @@ def test_to_dataframe_handles_missing_fields_as_none():
 
 
 # ---------------------------------------------------------------------------
-# Wire-level behaviour
+# Wire-level behavior
 # ---------------------------------------------------------------------------
 
 
@@ -261,7 +261,7 @@ def test_save_user_entry_announces_the_overwrite(manager):
 
     logged = str(manager.logger.info.call_args_list)
     assert "overwriting" in logged and "'old'" in logged
-    # Not a warning: overwriting is the intended, idempotent behaviour.
+    # Not a warning: overwriting is the intended, idempotent behavior.
     assert manager.logger.warning.call_count == 0
 
 

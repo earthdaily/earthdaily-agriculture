@@ -108,7 +108,7 @@ Two things follow, and they remove most of the remaining glue:
 | `limit` | `3000` | Max data points per request |
 | `historical_years` | `10` | Number of historical years to compare |
 | `extraction_mode` | `"period"` | Extraction mode — see below |
-| `target_dates` | `None` | List of specific dates to extract |
+| `target_dates` | `None` | **Deprecated** — only for `specific_dates` (removed in 3.0) |
 | `kpi_filter` | `None` | KPI aggregation filter |
 
 **`extraction_mode` values:**
@@ -116,7 +116,7 @@ Two things follow, and they remove most of the remaining glue:
 | Mode | Description |
 |---|---|
 | `period` | Continuous extraction between `start_date` and `end_date`. Default. |
-| `specific_dates` | Extract only on the dates listed in `target_dates`. Requires `target_dates`. |
+| `specific_dates` | **Deprecated, removed in 3.0.** Use `windows` over a range covering the dates you need, then filter the result. |
 | `windows` | Per-entity windowed extraction; `start_date` / `end_date` (or per-entity overrides) define the window. |
 
 ---
@@ -162,7 +162,25 @@ Two things follow, and they remove most of the remaining glue:
 | Parameter | Default | Description |
 |---|---|---|
 | `weather_type` | `"HISTORICAL_DAILY"` | Weather data type |
-| `weather_parameters` | `"none"` | Specific weather parameters to extract |
+| `weather_parameters` | `"precipitation.cumulative"` | Specific weather parameters to extract; `"none"` for all |
+| `kpi_filter` | `None` | KPI aggregation filter |
+
+---
+
+### WeatherFlowExtractor
+
+**Method:** `setup_weatherflow_parameters()`
+**Module:** `earthdaily.agriculture.extractors.weatherflow_functions`
+**Auth:** WeatherFlow API key (`WEATHERFLOW_API_KEY`), not the EarthDaily Agriculture token. See [Weather extractors](17 - Weather_extractors.md).
+
+| Parameter | Default | Description |
+|---|---|---|
+| `weather_type` | `"HISTORICAL_DAILY"` | `HISTORICAL_DAILY`, `HISTORICAL_HOURLY`, `FORECAST_DAILY` or `FORECAST_HOURLY` |
+| `model` | `None` | `era5`, `seamless`, `ifs` or `icon_eu`; `None` uses `era5` for history, `ifs` for forecasts |
+| `weather_parameters` | `"none"` | Columns to keep, by Weather v1 name or API name; `"none"` keeps all |
+| `units` | `"metric"` | Output unit profile: `metric` (°C, mm, km/h, W/m²), `imperial` (°F, in, mph, W/m²) or `native` |
+| `naming` | `"weather_v1"` | Output column names: `weather_v1` (`temperature.standardMax`) or `api` (`temperature_2m_max`) |
+| `historical_years` | `0` | Prior years for a KPI comparison |
 | `kpi_filter` | `None` | KPI aggregation filter |
 
 ---
@@ -546,6 +564,7 @@ Legend: **S** = season window params (`season_duration`, `season_start_day`, `se
 | VegationTsExtractor | `start_date`, `end_date` | `vegetation_index` | | | `extraction_mode`, `target_dates`, `historical_years`, `kpi_filter` |
 | MRTSExtractor | `start_date`, `end_date` | `vegetation_index` | | `sensors` | `smoothing_method`, `clear_cover_min`, `mode`, `historical_years`, `kpi_filter` |
 | WeatherExtractor | | | | | `weather_type`, `weather_parameters`, `kpi_filter` |
+| WeatherFlowExtractor | | `model` | | | `weather_type`, `weather_parameters`, `units`, `naming`, `kpi_filter` |
 | cropidExtractor | | | | | `begin_year`, `end_year`, `mask_type`, `limit_nb_crop`, `mode` |
 | ZoningExtractor | | | | | `num_zones`, `output_epsg`, `postprocess` |
 | RegionalExtractor | `start_date`, `end_date` | `index` | | | `idblock`, `idpixeltype`, `indicatorTypeIds`, `fillyeargap` |

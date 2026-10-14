@@ -3,7 +3,7 @@
 Covers the ISO path, placeholder handling, the MM-DD historical-average
 fallback (including the 02-29 leap-day case that a bare "%m-%d" — defaulting
 to the non-leap year 1900 — used to drop), and the pass-through for
-unrecognised input.
+unrecognized input.
 """
 
 import pytest

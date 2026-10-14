@@ -169,7 +169,7 @@ class TestSetupVegetationTsParameters:
         assert vts_extractor.vegetation_ts_params["historical_years"] == [2024, 2023, 2022]
 
     def test_historical_years_string_normalized_to_list(self, vts_extractor):
-        """Comma-separated string normalises to list of ints (notebook cell 37)."""
+        """Comma-separated string normalizes to list of ints (notebook cell 37)."""
         vts_extractor.setup_vegetation_ts_parameters(historical_years="2024,2023,2022")
         assert vts_extractor.vegetation_ts_params["historical_years"] == [2024, 2023, 2022]
 

@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
+from typing import get_args
 
 import pandas as pd
 
@@ -20,8 +21,10 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import DataSource, MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
 available_crops = {"CORN", "SECOND CORN", "SOYBEANS", "SUGARCANE", "COTTON", "OTHERS"}
 
@@ -50,13 +53,15 @@ class InSeasonMonitoringExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_InSeasonMonitoring.ipynb
+    OpenAPI: https://5gciu5p2msxwjrt54fks3kvvxu0oxdyr.lambda-url.us-east-1.on.aws/v1/openapi.json
+    Operation: POST /launch
 
     Args (setup_inseason_monitoring_parameters):
         season_duration (int): Season length in days. Default: 120
         season_start_day (int): Season start day of month. Default: 1
         season_start_month (int): Season start month. Default: 4
         year (str): Target year. Default: '2025'
-        data_source (str): Data source - 'LR' or 'MR'. A single source per run (the API
+        data_source (DataSource): Imagery resolution, low (LR) or medium (MR). A single source per run (the API
             takes one dataSource value); run twice to cover both. Default: 'LR'
         use_cache (bool): Reuse cached API responses and cache new results to avoid re-fetching. None uses the extractor's instance default. Default: None
 
@@ -140,7 +145,7 @@ class InSeasonMonitoringExtractor(BaseExtractor):
         season_start_day=1,
         season_start_month=4,
         year="2025",
-        data_source="LR",
+        data_source: DataSource = "LR",
         partial_frequency=50,
         column_mapping=None,
         output_mapping=None,
@@ -156,8 +161,8 @@ class InSeasonMonitoringExtractor(BaseExtractor):
             season_start_month (int): Crop cycle start month (1-12)
             season_start_day (int): Crop cycle start day (1-31)
             year (int): Year to analyze
-            data_source (str): Imagery type used to build the time series — 'LR' (low
-                resolution) or 'MR' (medium resolution). One source per run; the API takes
+            data_source (DataSource): Imagery used to build the time series: low (LR) or
+                medium (MR) resolution. One source per run; the API takes
                 a single dataSource value. Default: 'LR'
             partial_frequency (int): How often to save partial results
         """
@@ -174,18 +179,15 @@ class InSeasonMonitoringExtractor(BaseExtractor):
             raise ValueError(f"Invalid season_start_day={season_start_day}. Must be between 1 and 31.")
 
         # Data source validation — a single source per run: the API query carries one
-        # dataSource value, so a list would serialise straight into the URL.
-        available_sources = {"LR", "MR"}
+        # dataSource value, so a list would serialize straight into the URL.
         if isinstance(data_source, (list, tuple, set)):
             error_msg = (
                 f"data_source must be a single source string, got {data_source!r}. "
-                f"Choose one of {available_sources} and run once per source if you need both."
+                f"Choose one of {list(get_args(DataSource))} and run once per source if you need both."
             )
             self.logger.error(error_msg)
             raise ValueError(error_msg)
-        if data_source not in available_sources:
-            self.logger.error(f"Invalid data_source '{data_source}'")
-            raise ValueError(f"Invalid data_source '{data_source}'. Choose from: {available_sources}")
+        data_source = self._check_choice("data_source", data_source, DataSource)
 
         self.apply_cache_setting(use_cache)
 
@@ -436,13 +438,14 @@ class InSeasonMonitoringExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="inseason",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of In-Season Monitoring (ISM) requests using threads + progress bar,
         with optional fail-safe retry and partial save capabilities.
@@ -464,6 +467,9 @@ class InSeasonMonitoringExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "inseason".
             use_cache (bool, optional): Enable/disable caching for this call.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict:
@@ -477,6 +483,7 @@ class InSeasonMonitoringExtractor(BaseExtractor):
                     "failed_ids": list[str]
                 }
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache is not None and use_cache:
             return self._bulk_with_cache(
                 bulk_method=self._process_inseason_bulk_extraction_parallel_inner,
@@ -526,7 +533,7 @@ class InSeasonMonitoringExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="inseason",
         generate_report=False,
@@ -547,10 +554,7 @@ class InSeasonMonitoringExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            self.logger.error(f"Invalid merge_existing='{merge_existing}'")
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         self.logger.debug(f"Merge mode: {merge_existing}")
 
@@ -583,12 +587,12 @@ class InSeasonMonitoringExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_inseason_monitoring)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             self.logger.debug(f"ThreadPoolExecutor started with {max_workers} workers")
             future_to_id = {
-                executor.submit(self.process_single_entity_inseason_monitoring, row, params): self.get_entity_value(
-                    row, "id"
-                )
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

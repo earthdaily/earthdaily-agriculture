@@ -182,7 +182,7 @@ class TestFormatHistoricalScoreJsonEdgeCases:
         Note: the dict-type check is *after* an unconditional `.get("id", ...)` call,
         so the actual error is AttributeError, not the documented ValueError. Both
         are valid failures for the caller (any Exception subclass works), but we
-        document the current behaviour rather than the intent.
+        document the current behavior rather than the intent.
         """
         with pytest.raises(AttributeError):
             configured_historical_score_extractor.format_historical_score_json([{"id": "x"}])

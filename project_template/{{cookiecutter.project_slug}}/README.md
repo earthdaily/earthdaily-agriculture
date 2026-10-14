@@ -13,10 +13,14 @@
 ├── README.md
 ├── CLAUDE.md                          # Project context for Claude Code
 ├── Dockerfile                         # Container image (Pattern B)
+├── Dockerfile.headless                # Lean image for large stateless runs (Pattern B)
 ├── app/                               # Project-specific code
 │   ├── __init__.py
 │   ├── transforms.py                  # Workflow transforms
-│   └── run_pipeline.py                # Headless entrypoint for cron / containers
+│   ├── run_pipeline.py                # Workflow entrypoint (cron / containers, < 100k entities)
+│   ├── run_extractor.py               # One extractor on one shard (large stateless runs)
+│   ├── dispatch_shards.py             # Split entities into time-sized shards (fan-out)
+│   └── merge_shards.py                # Merge shard results (fan-in)
 ├── configuration/                     # YAML workflow definitions
 │   └── workflow.yml
 ├── docs/                              # Bundled EarthDaily Agriculture reference docs + showcases
@@ -99,6 +103,7 @@ Run all hooks manually (no commit): `pre-commit run --all-files`.
 Two supported patterns — see [`docs/14 - Deployment_patterns.md`](docs/14%20-%20Deployment_patterns.md) for the full decision guide.
 
 - **Pattern A — GitHub Actions cron** (default for daily/weekly extractions): the `.github/workflows/automated_extraction.yml` skeleton runs `python -m app.run_pipeline` on a cron, scrapes the `REPORT_PATH=` stdout line, uploads the artifact, and (once secrets are wired) ships it to S3. Lowest operational surface area; pick this first.
-- **Pattern B — Docker container** (for runs > 4 hrs, fan-out, VPC requirements, or sub-hourly cadence): the `Dockerfile` + `.dockerignore` produce an image that runs the same `app/run_pipeline.py` under ECS / Cloud Run / Argo / `docker run`. Set `EDAGRO_OUTPUT_PREFIX=s3://...` to route all writers to S3.
+- **Pattern B — Docker container** (for runs > 4 hrs, fan-out, VPC requirements, or sub-hourly cadence): the `Dockerfile` + `.dockerignore` produce an image that runs the same `app/run_pipeline.py` on any container scheduler or under `docker run`. For large stateless runs, `Dockerfile.headless` builds a leaner image (no notebook tooling) that refuses to start unless outputs go to remote storage. Set `EDAGRO_OUTPUT_PREFIX=s3://...` to route all writers to S3.
+- **Large stateless runs** (100k entities and up): `app.dispatch_shards` splits the entities into time-sized shards, one container per shard runs `app.run_extractor` (the extractor directly, no workflow), a `--retry-failed` pass re-runs only failed entities, and `app.merge_shards` builds one result. See `docs/14 - Deployment_patterns.md`.
 
 Both patterns share the same entrypoint, same YAML, same wheel — the migration is mechanical.

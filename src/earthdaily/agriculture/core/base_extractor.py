@@ -12,7 +12,10 @@ from loguru import logger
 
 from earthdaily.agriculture.core._fs import apply_output_prefix
 from earthdaily.agriculture.core.api_utils import export_results
+from earthdaily.agriculture.core.choices import check_choice, check_choices
 from earthdaily.agriculture.core.logging_setup import setup_logging
+from earthdaily.agriculture.core.rate_limit import RateLimiter, validate_rate_limit
+from earthdaily.agriculture.core.rate_limit import bound as bound_limiter
 
 # Default geohash precision for spatial grouping of point-based extractors
 # (Weather / GDD / GDD-offset). 5 ≈ 4.9 km cells — matched to the coarse weather
@@ -111,6 +114,14 @@ class BaseExtractor:
     ``EDAGRO_EXPORT_FORMAT`` env var, or by assigning ``extractor.export_format``
     directly. Parquet requires ``pyarrow`` (already a dependency); error files are
     always written as CSV.
+
+    Bulk runs can be rate limited with ``rate_limit``: the most HTTP requests per second a
+    run sends, retries included, shared by all ``max_workers`` threads. A 429 pauses every
+    worker of the run for the server's ``Retry-After``. Pass it to any bulk method
+    (``process_..._bulk_parallel(..., rate_limit=5)``, or ``run.params.rate_limit`` in a
+    workflow step), or set ``extractor.rate_limit``; a subclass may set
+    ``DEFAULT_RATE_LIMIT``. The default everywhere is ``None``: no limit. Single-entity
+    calls are never throttled. Subclasses wire it with :meth:`_paced`.
     """
 
     # Default column mapping for entity data fields.
@@ -149,6 +160,14 @@ class BaseExtractor:
     #: elsewhere override this and refresh through their own
     #: :meth:`get_new_token`.
     AUTH_PROVIDER = "geosys"
+
+    #: HTTP requests per second (retries included) for a bulk run by default, or ``None``
+    #: for no limit.
+    #: An extractor whose API has a known quota overrides this. Precedence, highest
+    #: first: the bulk method's ``rate_limit=`` argument (also a workflow step's
+    #: ``run.params.rate_limit``), then ``extractor.rate_limit``, then this.
+    #: Single-entity calls are never throttled. See :meth:`_paced`.
+    DEFAULT_RATE_LIMIT = None
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
         self.bearer_token = bearer_token
@@ -222,8 +241,15 @@ class BaseExtractor:
         #
         # Precedence: config["output_uri"] (WorkflowManager forwards
         # workflow.yml `settings.output_uri`) > EDAGRO_OUTPUT_URI env > None
-        # (local-only, today's behaviour).
+        # (local-only, today's behavior).
         self.output_uri = config.get("output_uri") or os.getenv("EDAGRO_OUTPUT_URI") or None
+
+        # 🚦 Requests per second for this extractor's bulk runs (None = no limit).
+        # Per extractor on purpose: no global setting or env var, since each API has
+        # its own quota. Overridden per run by the bulk method's `rate_limit=`, which
+        # each public bulk method stores in `_bulk_rate_limit` (see `_paced`).
+        self.rate_limit = None
+        self._bulk_rate_limit = None
         # ♻️ Resume mode — process ONLY the entities recorded in a previous run's
         # ``failed_ids_<prefix>_<ts>.csv``. Explicit and opt-in: ``True`` picks the
         # newest such file for the prefix, a string names one file exactly.
@@ -679,6 +705,31 @@ class BaseExtractor:
         return df
 
     # -------------------------------
+    # ALLOWED VALUES
+    # -------------------------------
+
+    def _check_choice(self, name, value, choices):
+        """Validate ``value`` against its ``Literal`` type (see ``core.choices``).
+
+        Returns the canonical value; on a bad value, logs and raises ``ValueError``
+        starting ``Invalid <name>``. One helper for every extractor, so the allowed
+        values live only in the parameter's type, never in a second list here.
+        """
+        try:
+            return check_choice(name, value, choices)
+        except ValueError as exc:
+            getattr(self, "logger", logger).error(str(exc))
+            raise
+
+    def _check_choices(self, name, values, choices):
+        """``_check_choice`` for a list parameter: every item must be allowed (see ``core.choices``)."""
+        try:
+            return check_choices(name, values, choices)
+        except ValueError as exc:
+            getattr(self, "logger", logger).error(str(exc))
+            raise
+
+    # -------------------------------
     # 🗃️ CACHE MANAGEMENT
     # -------------------------------
 
@@ -991,7 +1042,7 @@ class BaseExtractor:
         # Callers key the cache on their SETUP params, but a run-level override
         # (`params_kw`, e.g. a workflow's `run.params.params`) changes what the request
         # returns too. Without it in the key, a second run with different overrides was
-        # served the first run's cached rows. Serialised with sorted keys so the same
+        # served the first run's cached rows. Serialized with sorted keys so the same
         # override always maps to the same file; no override leaves the key untouched,
         # so existing caches stay valid.
         run_params = bulk_kwargs.get("params_kw")
@@ -1111,7 +1162,8 @@ class BaseExtractor:
             if pd.isna(lo) or lo > win_start or pd.isna(hi) or hi < win_end:
                 continue
             in_cell = cached[cached["_cell_key"] == cell]
-            rows = in_cell[(in_cell["_d"] >= win_start) & (in_cell["_d"] <= win_end)]
+            # Windows are whole days: the end includes every hour of its day (hourly rows).
+            rows = in_cell[(in_cell["_d"] >= win_start) & (in_cell["_d"] < win_end + pd.Timedelta(days=1))]
             if rows.empty:
                 continue
             # Cached rows come from a pull that may have started *earlier* than this
@@ -1161,7 +1213,9 @@ class BaseExtractor:
                 path.unlink(missing_ok=True)
 
         combined = pd.concat([existing, new_rows], ignore_index=True)
-        dedup = [c for c in ("_cell_key", date_column) if c in combined.columns]
+        # `date_utc` (hourly WeatherFlow rows) joins the key when present: when daylight saving
+        # ends, two real hours share a local `date`, and deduplicating on it alone drops one.
+        dedup = [c for c in ("_cell_key", date_column, "date_utc") if c in combined.columns]
         if dedup:
             combined = combined.drop_duplicates(subset=dedup, keep="last")
 
@@ -1344,7 +1398,7 @@ class BaseExtractor:
                 # anyway, so it is not being widened. The test has to hold for EVERY
                 # member, so the binding constraint is the SMALLEST own-window in the
                 # bucket: taking the new member's own length alone would let a
-                # long-history field swallow short-history neighbours whenever it
+                # long-history field swallow short-history neighbors whenever it
                 # happened to arrive second.
                 allowance = max(cap, min(bmin, own)) if cap is not None else None
                 if allowance is not None and (ne - ns) > allowance:
@@ -1403,7 +1457,7 @@ class BaseExtractor:
 
         The weather API returns tz-aware dates (``datetime64[us, UTC]``) while entity
         windows arrive as plain date strings. Comparing the two raises, so both sides
-        are normalised to naive UTC before any window arithmetic.
+        are normalized to naive UTC before any window arithmetic.
         """
         parsed = pd.to_datetime(values, errors="coerce", utc=True)
         if isinstance(parsed, pd.Series):
@@ -1446,8 +1500,12 @@ class BaseExtractor:
                 pre = pre.sort_values("_d").groupby("_member_row_id", sort=False).last()
                 baselines = pre[cum_cols]
 
-        # Clip to the member's own window; rows without a usable window are kept.
-        keep = ((dates >= m_start) & (dates <= m_end)) | m_start.isna() | m_end.isna() | dates.isna()
+        # Clip to the member's own window; rows without a usable window are kept. Windows are
+        # whole days, so the end includes every hour of its day: `<= m_end` (midnight) kept
+        # daily rows but dropped hourly rows after 00:00 on the last day.
+        keep = (
+            ((dates >= m_start) & (dates < m_end + pd.Timedelta(days=1))) | m_start.isna() | m_end.isna() | dates.isna()
+        )
         out = merged.loc[keep].copy()
 
         if cum_cols and baselines is not None and not out.empty:
@@ -1467,7 +1525,7 @@ class BaseExtractor:
         """
         Tag freshly fetched representative rows with their spatial group key, via the
         representative's own id — the only link the result carries back to its group.
-        Returns None if the result has no recognisable id column.
+        Returns None if the result has no recognizable id column.
         """
         id_result_cols = [c for c in ("entity_id", id_col) if c in rep_df.columns]
         if not id_result_cols:
@@ -1566,6 +1624,72 @@ class BaseExtractor:
         ordered = [c for c in result_cols if c in merged.columns]
         ordered += [c for c in merged.columns if c not in ordered]
         return merged[ordered]
+
+    # ------------------------------------------------------------------
+    # 🚦 Bulk rate limiting
+    # ------------------------------------------------------------------
+
+    def _resolve_rate_limit(self, rate_limit=None):
+        """Requests per second for a bulk run, or ``None`` for no limit.
+
+        Precedence: the ``rate_limit`` argument, then the current bulk call's
+        ``rate_limit=`` (stored by the public bulk method as ``_bulk_rate_limit``), then
+        ``self.rate_limit``, then the class's ``DEFAULT_RATE_LIMIT``.
+
+        Raises:
+            ValueError: if the value that wins is not a positive number.
+        """
+        candidates = (
+            rate_limit,
+            getattr(self, "_bulk_rate_limit", None),
+            getattr(self, "rate_limit", None),
+            self.DEFAULT_RATE_LIMIT,
+        )
+        for value in candidates:
+            if value is not None:
+                return validate_rate_limit(value)
+        return None
+
+    def _paced(self, fn, rate_limit=None):
+        """Wrap a bulk run's per-entity worker so its HTTP requests, retries included, stay at most ``rate_limit`` per second.
+
+        Call it ONCE per bulk run, before the submit loop, and submit the wrapper: every
+        worker thread then shares one limiter. Calling it per submit would give each
+        entity its own limiter, which limits nothing.
+
+            paced = self._paced(self.process_single_entity_x)
+            futures = {executor.submit(paced, row, params): ... for row in rows}
+
+        The public bulk method takes ``rate_limit=None`` and stores it first thing as
+        ``self._bulk_rate_limit``; the cache wrapper and inner method then need no
+        plumbing, since the limit is read here. One bulk run per instance at a time.
+
+        Every HTTP attempt is paced, retries included: the wrapper takes one token per
+        entity and binds the limiter to the worker thread with a one-shot credit for it
+        (``rate_limit.bound``). ``retry_with_backoff_no_retry_on_400`` spends that credit
+        on its first attempt and takes a token for every later one, and a 429 holds the
+        whole run for ``Retry-After`` (``RateLimiter.penalize``). A worker that does not
+        call the helper is still paced once per entity.
+
+        Returns ``fn`` itself when no limit applies, so an unlimited run is unchanged.
+        The wait happens inside the worker thread; ``max_workers`` is untouched.
+        """
+        rate = self._resolve_rate_limit(rate_limit)
+        if rate is None:
+            return fn
+        limiter = RateLimiter(rate)
+        getattr(self, "logger", logger).info(
+            f"🚦 Rate limit: {rate:g} requests/s across all workers (retries included)"
+        )
+
+        @wraps(fn)
+        def paced(*args, **kwargs):
+            limiter.acquire()
+            with bound_limiter(limiter):
+                return fn(*args, **kwargs)
+
+        paced.limiter = limiter
+        return paced
 
     def _run_bulk_spatially_grouped(
         self,
@@ -2008,7 +2132,7 @@ class BaseExtractor:
             entity_list: The already-filtered entity DataFrame.
             prefix: Export prefix — selects which ``failed_ids_<prefix>_*.csv`` to read.
             fail_safe: Only used to decide whether an *unused* resume file is worth
-                warning about (these are the callers whose behaviour changed).
+                warning about (these are the callers whose behavior changed).
             log: Contextualised logger; falls back to the module logger.
 
         Returns:
@@ -2023,7 +2147,7 @@ class BaseExtractor:
         retry = getattr(self, "retry_failed_only", False)
 
         if not retry:
-            # Behaviour change notice: this is the call that used to be narrowed.
+            # Behavior change notice: this is the call that used to be narrowed.
             if fail_safe:
                 stale = self._failed_ids_files(prefix)
                 if stale:

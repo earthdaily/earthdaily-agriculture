@@ -3,6 +3,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
+from typing import Literal
 
 import pandas as pd
 
@@ -20,10 +21,30 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
     validate_historical_years,
     validate_kpi_filter,
+    warn_specific_dates_deprecated,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import ExtractionMode, MergeMode, register_case_insensitive
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
+
+# Allowed values: one list each, read by the validator (BaseExtractor._check_choice)
+# and by generate_ai_context. Declared here, never repeated in a docstring.
+VegetationTsVegetationIndex = Literal["NDVI", "EVI"]
+# MRTS (field-level-maps v5 /time-serie). Added 2026-10-06: CVIN and BI (live calls returned
+# data) and BIOMASS (zone-limited like LAI, confirmed by the product owner; the probe fields were
+# outside its zones, so it came back empty there). The API enum also lists Cab and Rvi: not added,
+# unverified. W6 compares these with the API enums.
+MrtsVegetationIndex = Literal[
+    "NDVI", "EVI", "CVI", "CVIN", "GNDVI", "NDWI", "LAI", "NDRE", "NDMI", "S2REP", "BI", "BIOMASS"
+]
+MrtsSensor = Literal["Sentinel_2", "Landsat_8", "Landsat_9", "HJ2B_CCD4", "GAOFEN_6_WFV3"]
+MrtsSmoothingMethod = Literal["Whittaker", "SavitzkyGolay", "None"]
+MrtsAggregation = Literal["average", "median", "max", "min", "accumulation", "std"]
+MrtsMask = Literal["Native", "ACM", "Auto", "ML", "MLCirrus"]
+register_case_insensitive(MrtsMask)
+MrtsMode = Literal["full", "raw"]
 
 
 def require_vegetation_ts_params(func):
@@ -64,16 +85,18 @@ class VegationTsExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Vegetation_time_series/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_VTS.ipynb
+    OpenAPI: https://api.geosys-na.net/vegetation-time-series/v1/swagger/v1.0/swagger.json
+    Operation: GET /season-fields/values
 
     Args (setup_vegetation_ts_parameters):
         start_date (str): Start date in YYYY-MM-DD format
         end_date (str): End date in YYYY-MM-DD format
-        vegetation_index (str): Index type ('NDVI', 'EVI', 'CVI', 'GNDVI', 'NDWI', 'LAI'). Default: 'NDVI'
+        vegetation_index (VegetationTsVegetationIndex): Index of the time series. Default: 'NDVI'
         is_extrapolated (bool): Include extrapolated values. Default: True
         limit (int): Max number of records. Default: 3000
         historical_years (int): Number of historical years. Default: 10
-        extraction_mode (str): 'period' or 'target_dates'. Default: 'period'
-        target_dates (list): Specific dates to extract (for target_dates mode)
+        extraction_mode (ExtractionMode): How the dates are selected. 'specific_dates' is deprecated and removed in 3.0; use 'windows'. Default: 'period'
+        target_dates (list): Deprecated — only for 'specific_dates'. Default: None
         kpi_filter (dict): KPI aggregation config (kpi_name, aggregation, threshold)
         use_cache (bool): Reuse cached API responses and cache new results to avoid re-fetching. None uses the extractor's instance default. Default: None
 
@@ -119,12 +142,12 @@ class VegationTsExtractor(BaseExtractor):
         self,
         start_date: str = None,
         end_date: str = None,
-        vegetation_index="NDVI",
+        vegetation_index: VegetationTsVegetationIndex = "NDVI",
         is_extrapolated=True,
         limit=3000,
         historical_years=10,
         partial_frequency=50,
-        extraction_mode="period",
+        extraction_mode: ExtractionMode = "period",
         target_dates=None,
         kpi_filter=None,
         column_mapping=None,
@@ -141,20 +164,19 @@ class VegationTsExtractor(BaseExtractor):
                 Used as default when entity_data does not provide its own start_date.
             end_date (str, optional): Baseline end date in YYYY-MM-DD format.
                 Used as default when entity_data does not provide its own end_date.
-            vegetation_index (str): Vegetation index to extract (NDVI, EVI)
+            vegetation_index (VegetationTsVegetationIndex): Vegetation index to extract
             is_extrapolated (bool): Whether to include extrapolated values
             limit (int): Maximum number of records to retrieve
             historical_years (int): Number of historical years to include (max 15)
             partial_frequency (int): How often to save partial results
-            extraction_mode (str): Extraction mode.
+            extraction_mode (ExtractionMode): Extraction mode.
                 - 'period': seasonal MM-DD window extraction. Uses start_date/end_date as baseline
                   (entity_data can override). Expands by historical_years for KPI comparison.
                 - 'windows': absolute date range extraction. Uses start_date/end_date as baseline
                   (entity_data can override). No historical expansion.
-                - 'specific_dates': punctual extraction at exact target dates.
-            target_dates (list, optional):
-                - List of specific dates (YYYY-MM-DD) when mode='specific_dates'
-                - Not used for 'period' or 'windows' modes
+                - 'specific_dates': **deprecated, removed in 3.0** — use 'windows' over a range
+                  covering the dates, then filter the result.
+            target_dates (list, optional): **Deprecated** — only for 'specific_dates'.
             kpi_filter (dict, optional): KPI configuration
         """
         self.logger.info("⚙️ Setting up vegetation time series parameters...")
@@ -173,10 +195,7 @@ class VegationTsExtractor(BaseExtractor):
                 raise ValueError(f"Invalid end_date format '{end_date}'. Expected YYYY-MM-DD")
 
         # Validate vegetation index
-        valid_indexes = {"NDVI", "EVI"}
-        if vegetation_index not in valid_indexes:
-            self.logger.error(f"Invalid vegetation_index '{vegetation_index}'")
-            raise ValueError(f"Invalid vegetation_index '{vegetation_index}'. Must be one of {valid_indexes}")
+        vegetation_index = self._check_choice("vegetation_index", vegetation_index, VegetationTsVegetationIndex)
 
         if not isinstance(limit, int) or limit < 1:
             self.logger.error(f"Invalid limit={limit}")
@@ -187,13 +206,11 @@ class VegationTsExtractor(BaseExtractor):
             raise ValueError(f"Invalid is_extrapolated={is_extrapolated}. Must be True or False.")
 
         # Validate extraction_mode
-        valid_modes = {"period", "specific_dates", "windows"}
-        if extraction_mode not in valid_modes:
-            self.logger.error(f"Invalid extraction_mode '{extraction_mode}'")
-            raise ValueError(f"Invalid extraction_mode '{extraction_mode}'. Must be one of {valid_modes}")
+        extraction_mode = self._check_choice("extraction_mode", extraction_mode, ExtractionMode)
 
         # Validate target_dates if specific_dates mode
         if extraction_mode == "specific_dates":
+            warn_specific_dates_deprecated("setup_vegetation_ts_parameters", self.logger)
             if target_dates is None or len(target_dates) == 0:
                 self.logger.error("target_dates required for specific_dates mode")
                 raise ValueError("❌ target_dates must be provided when extraction_mode='specific_dates'")
@@ -283,6 +300,10 @@ class VegationTsExtractor(BaseExtractor):
         """
         Process a single entity for vegetation time series extraction at specific dates.
 
+        .. deprecated::
+            Specific-dates extraction is removed in 3.0. Use ``extraction_mode='windows'``
+            over a range covering the dates, then filter the result.
+
         Args:
             row (pd.Series or dict): Entity data with 'id' and 'name'
             params (dict, optional): Override vegetation_ts_params
@@ -290,6 +311,7 @@ class VegationTsExtractor(BaseExtractor):
         Returns:
             dict: Contains 'data' (DataFrame with columns: date, field_name, ndvi_value) and 'error'
         """
+        warn_specific_dates_deprecated("process_single_entity_specific_dates", self.logger)
         if params is None:
             params = self.vegetation_ts_params
 
@@ -380,8 +402,8 @@ class VegationTsExtractor(BaseExtractor):
                 - 'id' (str): Season field ID
                 - 'start_date' (str): Start date in YYYY-MM-DD format (required for 'period' mode)
                 - 'end_date' (str): End date in YYYY-MM-DD format (required for 'period' mode)
-                Note: For 'windows' mode, start_date and end_date are optional and will use
-                    target_dates from vegetation_ts_params if not provided
+                Note: in every mode, missing start_date / end_date fall back to the setup
+                    values in vegetation_ts_params.
 
         Returns:
             dict: JSON response with vegetation time series data
@@ -725,13 +747,14 @@ class VegationTsExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="vegetation_ts",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of entity vegetation time series using threads + progress bar,
         with optional fail-safe retry, filter capabilities, and caching.
@@ -753,12 +776,16 @@ class VegationTsExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "vegetation_ts".
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics.
                   When cache is active, also includes cache_hit and cache_miss counts.
         """
         # Route through cache wrapper if caching is enabled
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
             return self._bulk_with_cache(
@@ -811,7 +838,7 @@ class VegationTsExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="vegetation_ts",
         generate_report=False,
@@ -829,10 +856,7 @@ class VegationTsExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            self.logger.error(f"Invalid merge_existing='{merge_existing}'")
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         self.logger.debug(f"Merge mode: {merge_existing}")
 
@@ -867,10 +891,12 @@ class VegationTsExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_vegetation_ts)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             self.logger.debug(f"ThreadPoolExecutor started with {max_workers} workers")
             future_to_id = {
-                executor.submit(self.process_single_entity_vegetation_ts, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 
@@ -1005,10 +1031,16 @@ class VegationTsExtractor(BaseExtractor):
         generate_report=False,
         report_options=None,
         use_cache=None,
+        rate_limit=None,
     ):
         """
         Bulk processing of vegetation time series at specific dates using parallel threads,
         with optional caching.
+
+        .. deprecated::
+            Specific-dates extraction is removed in 3.0. Use
+            ``process_entity_vegetation_ts_bulk_parallel`` with ``extraction_mode='windows'``
+            over a range covering the dates, then filter the result.
 
         Args:
             entity_list (pd.DataFrame): Entities with 'id' and 'name' columns
@@ -1023,11 +1055,16 @@ class VegationTsExtractor(BaseExtractor):
             skip_export (bool): Skip final export
             prefix (str): Output filename prefix
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Results DataFrame, errors, and statistics.
                   When cache is active, also includes cache_hit and cache_miss counts.
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
+        warn_specific_dates_deprecated("process_specific_dates_bulk_parallel", self.logger)
         # Route through cache wrapper if caching is enabled
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
@@ -1119,11 +1156,11 @@ class VegationTsExtractor(BaseExtractor):
         )
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_specific_dates)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_specific_dates, row, params): self.get_entity_value(
-                    row, "id"
-                )
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 
@@ -1242,21 +1279,25 @@ class MRTSExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Vegetation_time_series/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_MRTS_extraction_functions.ipynb
+    OpenAPI: https://api.geosys-na.net/field-level-maps/v5/swagger/v1/swagger.json
+    Operation: POST /time-serie
 
     Args (setup_mrts_parameters):
         start_date (str): Start date in YYYY-MM-DD format. Default: '2025-05-01'
         end_date (str): End date in YYYY-MM-DD format. Default: '2025-10-15'
-        sensors (list): Sensor list (Sentinel_2, Landsat_8, Landsat_9, etc.). Default: None (all)
-        vegetation_index (str): Index type ('NDVI', 'EVI', 'CVI', 'GNDVI', 'NDWI', 'LAI'). Default: 'NDVI'
-        aggregation (str): Aggregation method ('average', 'median', 'max', 'min'). Default: 'average'
-        smoothing_method (str): Smoothing ('Whittaker', 'SavitzkyGolay', 'None'). Default: 'Whittaker'
+        sensors (list[MrtsSensor]): Keep only images from these sensors. Default: None (all)
+        vegetation_index (MrtsVegetationIndex): Index of the time series. 'LAI' needs a crop per
+            entity; 'LAI' and 'BIOMASS' are only served in specific zones: outside them the series
+            comes back empty, not as an error. Default: 'NDVI'
+        aggregation (MrtsAggregation): How pixel values are aggregated over the field. Default: 'average'
+        smoothing_method (MrtsSmoothingMethod): Smoothing applied to the series. Default: 'Whittaker'
         apply_denoiser (bool): Apply denoising filter. Default: True
         apply_end_of_curve (bool): Extrapolate end of curve. Default: True
         clear_cover_min (int): Minimum clear sky percentage (0-100). Default: 100
-        mask (str): Cloud mask used to discard NotClear pixels ('Native', 'ACM', 'Auto', 'ML',
-            'MLCirrus'). 'All' is NOT accepted here (coverage-only). Default: 'Auto' — best
-            mask picked per image. Pass None to omit the key entirely (same behaviour).
-        mode (str): Output mode ('full' = raw+smoothed, 'raw' = raw only). Default: 'full'
+        mask (MrtsMask): Cloud mask used to discard NotClear pixels. 'All' is NOT accepted here
+            (coverage-only). Default: 'Auto' — best
+            mask picked per image. Pass None to omit the key entirely (same behavior).
+        mode (MrtsMode): 'full' returns raw and smoothed values, 'raw' the raw values only. Default: 'full'
         compute_temporal_consistency (bool): Compute consistency checks. Default: True
         temporal_consistency_threshold (dict): Per-index thresholds. Example: {"Ndvi": 0.06, "Lai": 0.3}
         output_saturation (bool): Include index saturation flags in the output. Default: True
@@ -1284,27 +1325,6 @@ class MRTSExtractor(BaseExtractor):
         """
         # Initialize BaseExtractor first (sets env, paths, logger, credentials, etc.)
         super().__init__(bearer_token, token_expiration, config, workflow_ref)
-
-        # Available vegetation indices
-        self.available_indices = {"NDVI", "EVI", "CVI", "GNDVI", "NDWI", "LAI", "NDRE", "NDMI", "S2REP"}
-
-        # Available sensors
-        self.available_sensors = {"Sentinel_2", "Landsat_8", "Landsat_9", "HJ2B_CCD4", "GAOFEN_6_WFV3"}
-
-        # Available smoothing methods
-        self.available_smoothing = {"Whittaker", "SavitzkyGolay", "None"}
-
-        # Available aggregation methods
-        self.available_aggregation = {"average", "median", "max", "min", "accumulation", "std"}
-
-        # Available cloud masks (TimeSeriesMaskType) — canonical API casing keyed by lowercase input
-        self.available_masks = {
-            "native": "Native",
-            "acm": "ACM",
-            "auto": "Auto",
-            "ml": "ML",
-            "mlcirrus": "MLCirrus",
-        }
 
         # Vegetation time series parameters (initially None)
         self.vegetation_ts_params = None
@@ -1334,19 +1354,19 @@ class MRTSExtractor(BaseExtractor):
         self,
         start_date="2025-05-01",
         end_date="2025-10-15",
-        sensors=None,
-        vegetation_index="NDVI",
-        aggregation="average",
-        smoothing_method="Whittaker",
+        sensors: list[MrtsSensor] | None = None,
+        vegetation_index: MrtsVegetationIndex = "NDVI",
+        aggregation: MrtsAggregation = "average",
+        smoothing_method: MrtsSmoothingMethod = "Whittaker",
         apply_denoiser=True,
         apply_end_of_curve=True,
         clear_cover_min=100,
-        mask="Auto",
+        mask: MrtsMask | None = "Auto",
         output_saturation=True,
         extract_raw_datasets=True,
         compute_temporal_consistency=True,
         temporal_consistency_threshold=None,
-        mode="full",
+        mode: MrtsMode = "full",
         historical_years=10,
         partial_frequency=50,
         kpi_filter=None,
@@ -1362,22 +1382,21 @@ class MRTSExtractor(BaseExtractor):
         Args:
             start_date (str): Start date of the period (YYYY-MM-DD). Default: '2025-05-01'
             end_date (str): End date of the period (YYYY-MM-DD). Default: '2025-10-15'
-            sensors (list, optional): List of sensors to use.
-                                     Available: Sentinel_2, Landsat_8, Landsat_9, HJ2B_CCD4, GAOFEN_6_WFV3
-                                     Default: None (omitted from payload → API uses all available sensors)
-            vegetation_index (str): Vegetation index ('NDVI', 'EVI', 'CVI', 'GNDVI', 'NDWI', 'LAI'). Default: 'NDVI'
-            aggregation (str): Aggregation method ('average', 'median', 'max', 'min'). Default: 'average'
-            smoothing_method (str): Smoothing method ('Whittaker', 'SavitzkyGolay', 'None'). Default: 'Whittaker'
+            sensors (list[MrtsSensor], optional): Sensors to use. Default: None (omitted from
+                the payload, so the API uses all available sensors)
+            vegetation_index (MrtsVegetationIndex): Vegetation index. Default: 'NDVI'
+            aggregation (MrtsAggregation): How pixel values are aggregated over the field. Default: 'average'
+            smoothing_method (MrtsSmoothingMethod): Smoothing method. Default: 'Whittaker'
             apply_denoiser (bool): Apply denoising. Default: True
             apply_end_of_curve (bool): Apply end of curve extrapolation. Default: True
             clear_cover_min (int): Minimum clear sky coverage percentage (0-100). Default: 100
-            mask (str, optional): Cloud mask applied before aggregation (TimeSeriesMaskType).
-                One of 'Native', 'ACM', 'Auto', 'ML', 'MLCirrus' (case-insensitive; normalized to
-                the API casing). Unlike the coverage/catalog-imagery endpoint, 'All' is rejected
+            mask (MrtsMask, optional): Cloud mask applied before aggregation (TimeSeriesMaskType),
+                case-insensitive, normalized to the API casing. Unlike the coverage/catalog-imagery
+                endpoint, 'All' is rejected
                 by this endpoint (HTTP 400) — it is a coverage-only value.
                 Default: 'Auto' — the API selects the best available mask per image, which gives
                 the most complete series. This is also what the API does when the key is absent,
-                so the default is explicit, not a behaviour change; pass mask=None to omit it.
+                so the default is explicit, not a behavior change; pass mask=None to omit it.
                 Notes from live probing (prod, 2026-08-25, 3 sites x 2 seasons):
                   - omitting mask is identical to mask='Auto' (same observations, not just
                     the same count) — it is NOT Native and NOT ML
@@ -1394,7 +1413,7 @@ class MRTSExtractor(BaseExtractor):
             temporal_consistency_threshold (dict, optional): Threshold values for temporal consistency by index.
                 Example: {"Ndvi": 0.06, "Lai": 0.3, "S2Rep": 2.5}
                 If None and compute_temporal_consistency=True, uses default thresholds.
-            mode (str): Output mode. Default: 'full'
+            mode (MrtsMode): Output mode. Default: 'full'
                 - 'full': Returns both raw and smoothed data merged on date
                 - 'raw': Returns only raw observation data (no smoothed interpolation)
             partial_frequency (int): Partial save frequency during bulk processing. Default: 50
@@ -1407,10 +1426,7 @@ class MRTSExtractor(BaseExtractor):
         """
         self.logger.info("⚙️ Setting up MRTS parameters...")
 
-        # Vegetation index validation - use class-level available indices
-        if vegetation_index not in self.available_indices:
-            self.logger.error(f"Invalid vegetation_index '{vegetation_index}'")
-            raise ValueError(f"Invalid vegetation_index '{vegetation_index}'. Must be one of {self.available_indices}")
+        vegetation_index = self._check_choice("vegetation_index", vegetation_index, MrtsVegetationIndex)
 
         # LAI requires crop in entity data
         if vegetation_index == "LAI":
@@ -1422,23 +1438,13 @@ class MRTSExtractor(BaseExtractor):
 
         # Sensors: None means all sensors (omit from payload), otherwise validate list
         if sensors is not None:
-            invalid_sensors = [s for s in sensors if s not in self.available_sensors]
-            if invalid_sensors:
-                self.logger.error(f"Invalid sensors: {invalid_sensors}")
-                raise ValueError(f"Invalid sensors: {invalid_sensors}. Choose from: {self.available_sensors}")
+            sensors = self._check_choices("sensors", sensors, MrtsSensor)
             self.logger.debug(f"Using selected sensors: {sensors}")
         else:
             self.logger.debug("Sensors set to None → all available sensors will be used (omitted from payload)")
 
-        # Validate smoothing method
-        if smoothing_method not in self.available_smoothing:
-            self.logger.error(f"Invalid smoothing method '{smoothing_method}'")
-            raise ValueError(f"Invalid smoothing method '{smoothing_method}'. Choose from: {self.available_smoothing}")
-
-        # Validate aggregation method
-        if aggregation not in self.available_aggregation:
-            self.logger.error(f"Invalid aggregation '{aggregation}'")
-            raise ValueError(f"Invalid aggregation '{aggregation}'. Choose from: {self.available_aggregation}")
+        smoothing_method = self._check_choice("smoothing_method", smoothing_method, MrtsSmoothingMethod)
+        aggregation = self._check_choice("aggregation", aggregation, MrtsAggregation)
 
         # Date validation
         try:
@@ -1459,10 +1465,8 @@ class MRTSExtractor(BaseExtractor):
 
         # Cloud mask validation — normalize to the casing the API expects
         if mask is not None:
-            if not isinstance(mask, str) or mask.lower() not in self.available_masks:
-                self.logger.error(f"Invalid mask '{mask}'")
-                raise ValueError(f"Invalid mask '{mask}'. Choose from: {sorted(self.available_masks.values())}")
-            mask = self.available_masks[mask.lower()]
+            # Case-insensitive (registered with the alias): returns the API's casing.
+            mask = self._check_choice("mask", mask, MrtsMask)
             self.logger.debug(f"Cloud mask set to: {mask}")
         else:
             self.logger.debug("mask=None → key omitted from payload (API resolves it as 'Auto')")
@@ -1521,10 +1525,7 @@ class MRTSExtractor(BaseExtractor):
                 )
 
         # Validate mode
-        valid_modes = {"full", "raw"}
-        if mode not in valid_modes:
-            self.logger.error(f"Invalid mode '{mode}'")
-            raise ValueError(f"Invalid mode '{mode}'. Must be one of {valid_modes}")
+        mode = self._check_choice("mode", mode, MrtsMode)
         self.logger.debug(f"Output mode: {mode}")
 
         # Validate KPI filter (centralized rules — see api_utils.validate_kpi_filter)
@@ -2133,13 +2134,14 @@ class MRTSExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="mrts",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of entity medium resolution vegetation time series using threads + progress bar,
         with optional fail-safe retry, filter capabilities, and caching.
@@ -2161,12 +2163,16 @@ class MRTSExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "mrts".
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics.
                   When cache is active, also includes cache_hit and cache_miss counts.
         """
         # Route through cache wrapper if caching is enabled
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
             return self._bulk_with_cache(
@@ -2219,7 +2225,7 @@ class MRTSExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="mrts",
         generate_report=False,
@@ -2239,10 +2245,7 @@ class MRTSExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            self.logger.error(f"Invalid merge_existing='{merge_existing}'")
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         self.logger.debug(f"Merge mode: {merge_existing}")
 
@@ -2277,10 +2280,12 @@ class MRTSExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_mrts)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             self.logger.debug(f"ThreadPoolExecutor started with {max_workers} workers")
             future_to_id = {
-                executor.submit(self.process_single_entity_mrts, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

@@ -34,8 +34,10 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
 
 def require_location_based_border_params(func):
@@ -65,6 +67,8 @@ class LocationBasedBorderExtractor(BaseExtractor):
 
     Documentation: https://api.geosys-na.net/field-borders/v1/swagger/index.html
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_LocationBasedBorder.ipynb
+    OpenAPI: https://api.geosys-na.net/field-borders/v1/swagger/v1/swagger.json
+    Operation: GET /AutomaticBoundary
 
     Args (setup_location_based_border_parameters):
         simplified_geom (bool): If True, returns a simplified field geometry
@@ -489,20 +493,27 @@ class LocationBasedBorderExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="location_based_border",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """Bulk processing of location-based-border requests using threads + progress bar.
 
         Args mirror the family pattern (``coverage_function`` / ``difference_functions`` /
         ``processor_change_index_functions``). Returns the standard
         ``{results_df, global_errors, total_entities, total_calculations,
         successful_calculations, failed_calculations, failed_ids}`` dict.
+
+        Args:
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache is not None and use_cache:
             return self._bulk_with_cache(
                 bulk_method=self._process_location_based_border_bulk_extraction_parallel_inner,
@@ -552,7 +563,7 @@ class LocationBasedBorderExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="location_based_border",
         generate_report=False,
@@ -572,11 +583,7 @@ class LocationBasedBorderExtractor(BaseExtractor):
         if merge_existing is None:
             merge_existing = self.merge_existing
 
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -605,11 +612,11 @@ class LocationBasedBorderExtractor(BaseExtractor):
         log.info(f"Processing {len(filtered_entity_list)} entities in parallel...")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_location_based_border)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_location_based_border, row, params): self.get_entity_value(
-                    row, "id"
-                )
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

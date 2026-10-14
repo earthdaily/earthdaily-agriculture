@@ -21,7 +21,9 @@ from earthdaily.agriculture.core.api_utils import (
     safe_parse_date,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
+from earthdaily.agriculture.core.results import BulkResult
 
 # Decorator to ensure token validity before API calls
 
@@ -47,6 +49,8 @@ class ZARCExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/ZARC/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_ZARC.ipynb
+    OpenAPI: https://zvjihjkwfwohudwcnbhjbpsudq0jhszp.lambda-url.us-east-1.on.aws/openapi.json
+    Operation: POST /zarc
 
     Args (setup_zarc_parameters):
         crop (str): Crop type code. Default: 'OTHERS'
@@ -60,7 +64,7 @@ class ZARCExtractor(BaseExtractor):
         id, geometry (required); emergence_date (required per row, unless set in setup or run params — YYYY-MM-DD); crop, soil_type, cycle, nb_days_sowing_emergence (optional per-row overrides)
 
     Output columns:
-        entity_id, crop, risk_level, sowing_date, emergence_date, + soil water balance metrics
+        entity_id, emergence_date, sowing_date, zarc_start_date, zarc_end_date, status
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref: Optional[str] = None):
@@ -118,7 +122,7 @@ class ZARCExtractor(BaseExtractor):
         # Only stored when set: zarc_params is the cache key, so adding a None entry
         # would invalidate every existing cache for runs that never use the option.
         # normalize_date accepts ISO timestamps the same way per-row dates do; strptime
-        # is the validation (safe_parse_date returns unrecognised strings unchanged).
+        # is the validation (safe_parse_date returns unrecognized strings unchanged).
         if emergence_date:
             parsed = self.normalize_date(emergence_date)
             try:
@@ -180,7 +184,7 @@ class ZARCExtractor(BaseExtractor):
         # `emergence_date` is this extractor's one REQUIRED entity input, and it was
         # read with a plain dict lookup — so `column_mapping` never applied to the
         # only column a caller must supply. It is already in DEFAULT_COLUMN_MAPPING
-        # and DATE_FIELDS, so routing it here also normalises ISO timestamps and
+        # and DATE_FIELDS, so routing it here also normalizes ISO timestamps and
         # turns a NaN into None, which the missing-value check below reads correctly.
         raw_emergence_date = self.get_entity_value(entity_data, "emergence_date")
         if not raw_emergence_date:
@@ -512,7 +516,8 @@ class ZARCExtractor(BaseExtractor):
         report_options: Optional[Dict[str, Any]] = None,
         use_cache=None,
         params: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing for ZARC with parallel execution, filtering, and export capabilities.
 
@@ -535,10 +540,14 @@ class ZARCExtractor(BaseExtractor):
                 ``emergence_date``. Per-row values still win. This is also the argument
                 WorkflowManager always passes; without it a ZARC workflow step raised
                 ``TypeError``.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: Contains results DataFrame, errors list, and summary statistics
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache or (use_cache is None and getattr(self, "_cache_enabled", False)):
             return self._bulk_with_cache(
                 bulk_method=self._process_zarc_bulk_extraction_parallel_inner,
@@ -615,11 +624,7 @@ class ZARCExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -653,11 +658,11 @@ class ZARCExtractor(BaseExtractor):
 
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_zarc)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_zarc, row.to_dict(), params): self.get_entity_value(
-                    row, "id"
-                )
+                executor.submit(paced, row.to_dict(), params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

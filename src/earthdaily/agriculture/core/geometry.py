@@ -940,7 +940,7 @@ def get_geometry_stats(gdf: gpd.GeoDataFrame, verbose: bool = True) -> dict:
 
 
 # -------------------------------
-# 🧭 CRS + polygon normalisation
+# 🧭 CRS + polygon normalization
 # -------------------------------
 #
 # The platform stores field borders as WGS84 (EPSG:4326) WKT polygons. Input
@@ -959,7 +959,7 @@ def looks_like_lonlat(geometry: "BaseGeometry") -> bool:
 
     A CSV of WKT has no CRS metadata, so this is the only available signal that
     the coordinates are *not* degrees. It cannot prove they are — a small field
-    in a metre-based CRS near the origin would pass — but it reliably catches
+    in a meter-based CRS near the origin would pass — but it reliably catches
     the common case of UTM / state-plane / Web Mercator eastings and northings,
     which are orders of magnitude out of range.
     """
@@ -1032,7 +1032,7 @@ def normalize_field_geometry(
     min_area_ha: Optional[float] = None,
     verbose: bool = False,
 ) -> tuple:
-    """Normalise any geometry into a valid EPSG:4326 field border.
+    """Normalize any geometry into a valid EPSG:4326 field border.
 
     The one entry point for turning client-supplied geometry into something the
     entity APIs accept. Four things can be wrong with an input, and each is
@@ -1056,7 +1056,7 @@ def normalize_field_geometry(
         source_epsg: CRS of the input. None means "assume 4326 and verify".
         min_area_ha: Reject anything smaller, measured on the ellipsoid. None
             disables the check. A field under ~1 ha is usually a digitising
-            artefact or a units mistake, and holds too few pixels for
+            artifact or a units mistake, and holds too few pixels for
             field-level analytics either way.
         verbose: Log each fix as it is applied.
 

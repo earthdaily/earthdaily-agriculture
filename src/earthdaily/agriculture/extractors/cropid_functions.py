@@ -3,6 +3,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
+from typing import Literal, get_args
 
 import pandas as pd
 
@@ -19,11 +20,13 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
-available_mask_types = {"InSeason", "EndSeason", "PreSeason"}
-available_modes = {"history", "year", "historical_season", "full_history"}
+CropIdMaskType = Literal["InSeason", "EndSeason", "PreSeason"]
+CropIdMode = Literal["history", "year", "historical_season", "full_history"]
 
 
 def require_cropid_params(func):
@@ -50,14 +53,16 @@ class cropidExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_cropid.ipynb
+    OpenAPI: https://api.geosys-na.net/cropmasks/v1/swagger/v1/swagger.json
+    Operation: POST /cropmasks/crops
 
     Args (setup_cropid_parameters):
         begin_year (int): Start year for historical analysis. Default: 2020
         end_year (int): End year for analysis. Default: 2025
-        mask_type (str): Mask type ('EndSeason', 'InSeason', 'PreSeason'). Default: 'EndSeason'
+        mask_type (CropIdMaskType): Crop-mask type. Default: 'EndSeason'
         limit_nb_crop (int): Max number of crop candidates per field. Default: 1
         crop_mask_percent (int): Minimum crop mask percentage. Default: 50
-        mode (str): Output mode — 'history' (one row per (year, crop)),
+        mode (CropIdMode): Output mode — 'history' (one row per (year, crop)),
             'year' (filter to entity crop, long-form),
             'historical_season' (comma-separated string of matching years),
             'full_history' (wide-form, one row per entity, one column per year
@@ -75,6 +80,9 @@ class cropidExtractor(BaseExtractor):
         - 'historical_season' : entity_id, historical_season (comma-separated years)
         - 'full_history'      : entity_id + one column per year in [begin_year, end_year],
                                 filled with the top crop code (highest cropMaskPercent) per year
+
+    Constraints:
+        - end_year must not be before begin_year.
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -101,10 +109,10 @@ class cropidExtractor(BaseExtractor):
         self,
         begin_year=2020,
         end_year=2025,
-        mask_type="EndSeason",
+        mask_type: CropIdMaskType = "EndSeason",
         limit_nb_crop=1,
         crop_mask_percent=50,
-        mode="history",
+        mode: CropIdMode = "history",
         partial_frequency=50,
         column_mapping=None,
         output_mapping=None,
@@ -118,10 +126,10 @@ class cropidExtractor(BaseExtractor):
         Args:
             begin_year (int): Starting year (YYYY format, e.g., 2020)
             end_year (int): Ending year (YYYY format, e.g., 2025)
-            mask_type (str): Type of crop mask. Options: 'InSeason', 'EndSeason', 'PreSeason'
+            mask_type (CropIdMaskType): Type of crop mask
             limit_nb_crop (int): Maximum number of crops to return per field
             crop_mask_percent (int): Minimum percentage of field covered by crop (0-100)
-            mode (str): Processing mode — one of:
+            mode (CropIdMode): Processing mode:
                 - 'history'           : all crops/years (long-form, one row per (year, crop))
                 - 'year'              : filtered to entity crop (long-form)
                 - 'historical_season' : comma-separated string of matching years
@@ -137,10 +145,7 @@ class cropidExtractor(BaseExtractor):
         log.info("Configuring crop ID parameters...")
 
         # Mask type validation
-        if mask_type not in available_mask_types:
-            error_msg = f"Invalid mask_type '{mask_type}'. Choose from: {available_mask_types}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        mask_type = self._check_choice("mask_type", mask_type, CropIdMaskType)
 
         # Year validation
         current_year = datetime.now().year
@@ -172,10 +177,7 @@ class cropidExtractor(BaseExtractor):
             raise ValueError(error_msg)
 
         # Mode validation
-        if mode not in available_modes:
-            error_msg = f"Invalid mode '{mode}'. Choose from: {available_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        mode = self._check_choice("mode", mode, CropIdMode)
 
         # Partial frequency validation
         if not isinstance(partial_frequency, int) or partial_frequency < 0:
@@ -636,7 +638,7 @@ class cropidExtractor(BaseExtractor):
                 # Wide-form: one row per entity, one column per year in window.
                 cropid_df = self.format_cropid_full_history_json(raw_json, entity_data)
             else:
-                error_msg = f"Invalid mode '{mode}'. Must be one of: {sorted(available_modes)}"
+                error_msg = f"Invalid mode '{mode}'. Must be one of: {sorted(get_args(CropIdMode))}"
                 log.error(error_msg)
                 raise ValueError(error_msg)
 
@@ -665,13 +667,14 @@ class cropidExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="cropid",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of cropid requests using threads + progress bar,
         with optional fail-safe retry, partial save capabilities, and caching.
@@ -693,6 +696,9 @@ class cropidExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "cropid".
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict:
@@ -707,6 +713,7 @@ class cropidExtractor(BaseExtractor):
                 }
         """
         # Route through cache wrapper if caching is enabled
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
             return self._bulk_with_cache(
@@ -759,7 +766,7 @@ class cropidExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="cropid",
         generate_report=False,
@@ -781,11 +788,7 @@ class cropidExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -818,9 +821,11 @@ class cropidExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_cropid)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_cropid, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

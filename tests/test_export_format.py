@@ -4,7 +4,7 @@ Tests for the CSV / Parquet results-export switch (``export_format``).
 Covers the four layers the feature touches:
   1. ``api_utils.resolve_export_format`` — precedence + safe fallback.
   2. ``api_utils.export_results`` — writes csv/parquet; errors always stay csv;
-     inline partial flushes (no kwarg) honour ``EDAGRO_EXPORT_FORMAT``.
+     inline partial flushes (no kwarg) honor ``EDAGRO_EXPORT_FORMAT``.
   3. ``BaseExtractor`` — resolves ``self.export_format`` from config/env and
      ``_finalize_extraction`` writes the chosen format + cleans parquet partials.
   4. ``WorkflowManager`` — ``settings.export_format`` (and step-level override)

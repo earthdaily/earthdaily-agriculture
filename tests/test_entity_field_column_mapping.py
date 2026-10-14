@@ -231,7 +231,7 @@ class TestZarcEntityFields:
     @patch("earthdaily.agriculture.processors.processor_zarc_functions.validate_wkt", side_effect=lambda x: x)
     @patch("earthdaily.agriculture.processors.processor_zarc_functions.requests.post")
     def test_iso_timestamp_is_normalised(self, mock_post, _wkt, zarc_extractor):
-        """Routing through get_entity_value also normalises DATE_FIELDS, which a raw .get() did not."""
+        """Routing through get_entity_value also normalizes DATE_FIELDS, which a raw .get() did not."""
         mock_post.return_value = _json_response({"id": "field-1", "data": {}})
 
         zarc_extractor.get_zarc_api(

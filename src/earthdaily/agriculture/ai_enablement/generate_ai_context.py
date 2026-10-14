@@ -21,9 +21,16 @@ import os
 import re
 import shutil
 import sys
+import typing
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
+
+from earthdaily.agriculture.core.choices import choice_values, is_case_insensitive, literal_alias
+from earthdaily.agriculture.core.results import CORE_KEYS, KEY_DOCS, RESULT_TYPES, result_keys
+from earthdaily.agriculture.services.workflow_schema import BLOCK_TYPES as WORKFLOW_BLOCKS
+from earthdaily.agriculture.services.workflow_schema import KEY_DOCS as WORKFLOW_KEY_DOCS
+from earthdaily.agriculture.services.workflow_schema import RUN_PARAMS_RESERVED, TRAPS
 
 # ---------------------------------------------------------------------------
 # Registry of all extractors to introspect
@@ -44,6 +51,7 @@ EXTRACTOR_REGISTRY = [
     ("earthdaily.agriculture.extractors.VTS_functions", "VegationTsExtractor", "Foundational"),
     ("earthdaily.agriculture.extractors.VTS_functions", "MRTSExtractor", "Foundational"),
     ("earthdaily.agriculture.extractors.weather_functions", "WeatherExtractor", "Foundational"),
+    ("earthdaily.agriculture.extractors.weatherflow_functions", "WeatherFlowExtractor", "Foundational"),
     (
         "earthdaily.agriculture.processors.processor_emergence_functions",
         "EmergenceExtractor",
@@ -88,7 +96,7 @@ EXTRACTOR_REGISTRY = [
     ("earthdaily.agriculture.services.entity_management", "EntityManager", "Entity Management"),
     ("earthdaily.agriculture.services.user_management", "UserManager", "Entity Management"),
     # Admin plane. All five subclass BaseExtractor, but only the two above were
-    # ever registered, so the catalogue answered "is there a provisioning API?"
+    # ever registered, so the catalog answered "is there a provisioning API?"
     # with silence — and a model reading it concluded, reasonably and wrongly,
     # that the client has no admin surface at all. Provisioning is precisely
     # where that hurts: the narrative docs are data-plane only, so the code is
@@ -158,11 +166,14 @@ def parse_docstring(docstring: str) -> dict:
         "description": "",
         "documentation_url": None,
         "notebook": None,
+        "openapi_url": None,
+        "operations": [],
         "setup_args": [],
         "entity_fields": [],
         "entity_field_qualifiers": {},
         "entity_field_notes": [],
         "output_columns": [],
+        "constraints": [],
         "raw_sections_found": [],
     }
 
@@ -193,6 +204,16 @@ def parse_docstring(docstring: str) -> dict:
         result["notebook"] = match.group(1)
         result["raw_sections_found"].append("Notebook:")
 
+    # The machine-readable request schema: the OpenAPI document of the service this class
+    # calls, and the operation(s) in it. An agent fetches the schema instead of guessing
+    # the request body, and scripts/check_api_enums.py compares its enums with our Literals.
+    match = re.search(r"OpenAPI:\s*(https?://\S+)", full_text)
+    if match:
+        result["openapi_url"] = match.group(1)
+    result["operations"] = re.findall(
+        r"^\s*Operation:\s*((?:GET|POST|PUT|PATCH|DELETE)\s+/\S*)", full_text, re.MULTILINE
+    )
+
     # Args section — capture the full indented block (every indented, non-blank
     # line) until the first blank line / dedented section header. Using
     # ``[ \t]+\S`` instead of ``\s+\w+`` so multi-line arg descriptions whose
@@ -201,8 +222,17 @@ def parse_docstring(docstring: str) -> dict:
     args_match = re.search(r"Args.*?:\s*\n((?:[ \t]+\S.*\n)+)", full_text)
     if args_match:
         result["raw_sections_found"].append("Args")
-        for arg_line in args_match.group(1).strip().splitlines():
-            arg_line = arg_line.strip()
+        # A description wrapped onto more-indented lines belongs to the arg above it.
+        # Read line by line, the card used to stop mid-sentence ("…so the", "…to avoid").
+        raw_lines = [line for line in args_match.group(1).splitlines() if line.strip()]
+        base_indent = min(len(line) - len(line.lstrip()) for line in raw_lines)
+        logical_args: list[str] = []
+        for line in raw_lines:
+            if len(line) - len(line.lstrip()) > base_indent and logical_args:
+                logical_args[-1] += " " + line.strip()
+            else:
+                logical_args.append(line.strip())
+        for arg_line in logical_args:
             param_match = re.match(
                 r"(\w+)\s*\(([^)]+)\):\s*(.+?)(?:\.\s*Default:\s*(.+))?$",
                 arg_line,
@@ -293,6 +323,18 @@ def parse_docstring(docstring: str) -> dict:
                 if col and not col.startswith("(") and not col.startswith("historical") and len(col) < 60:
                     result["output_columns"].append(col)
 
+    # Constraints — rules between parameters that otherwise exist only as a `raise`.
+    # One `- ` bullet per rule; indented continuation lines join the bullet above.
+    constraints_match = re.search(r"Constraints:\s*\n((?:[ \t]+\S.*(?:\n|\Z))+)", full_text)
+    if constraints_match:
+        result["raw_sections_found"].append("Constraints:")
+        for raw in constraints_match.group(1).splitlines():
+            line = raw.strip()
+            if line.startswith("- "):
+                result["constraints"].append(line[2:].strip())
+            elif line and result["constraints"]:
+                result["constraints"][-1] += " " + line
+
     # Supported operations (for management classes)
     ops_match = re.search(r"Supported operations:\s*\n((?:\s+-.+\n)*)", full_text)
     if ops_match:
@@ -312,19 +354,67 @@ def get_setup_method(cls) -> dict | None:
     for name, method in inspect.getmembers(cls, predicate=inspect.isfunction):
         if name.startswith("setup_") and name.endswith("_parameters"):
             sig = inspect.signature(method)
+            hints = _type_hints(method)
             params = []
             for pname, param in sig.parameters.items():
                 if pname == "self":
                     continue
+                # Allowed values come from the signature's Literal hint (core/choices.py),
+                # never from docstring prose — that copy is what drifted.
+                choices = choice_values(hints.get(pname))
                 params.append(
                     {
                         "name": pname,
                         "default": repr(param.default) if param.default is not inspect.Parameter.empty else None,
                         "kind": str(param.kind),
+                        "choices": list(choices) if choices else None,
+                        "case_insensitive": bool(choices) and is_case_insensitive(literal_alias(hints.get(pname))),
                     }
                 )
             return {"method_name": name, "parameters": params}
     return None
+
+
+def _type_hints(func) -> dict:
+    """``typing.get_type_hints`` that never raises (unresolvable hints → no hints)."""
+    try:
+        return typing.get_type_hints(func)
+    except Exception:
+        return {}
+
+
+def get_run_method(cls, setup_method_name: str | None) -> dict | None:
+    """The bulk method to call after setup, plus the class's other bulk methods.
+
+    With one bulk method, that one. With several, the standard
+    ``process_entity_<type>_bulk_parallel`` named after ``setup_<type>_parameters`` — the
+    same rule ``app.run_extractor`` uses. None found → ``method`` is None and the card
+    lists the candidates instead (Tillage: submit, then retrieve).
+    """
+    # Defined on the class itself (not inherited from BaseExtractor).
+    bulk = sorted(
+        name
+        for name, fn in vars(cls).items()
+        if inspect.isfunction(fn) and name.startswith("process_") and "bulk" in name and "specific_dates" not in name
+    )
+    if not bulk:
+        return None
+    method = bulk[0] if len(bulk) == 1 else None
+    if method is None and setup_method_name:
+        standard = f"process_entity_{setup_method_name[len('setup_') : -len('_parameters')]}_bulk_parallel"
+        method = standard if standard in bulk else None
+    # The result type (BulkResult or one of its subclasses) names the keys this extractor
+    # can return, so the card lists those and not every optional key of every extractor.
+    returns, return_keys = None, []
+    rtype = _type_hints(getattr(cls, method)).get("return") if method else None
+    if rtype is not None and rtype in RESULT_TYPES:
+        returns, return_keys = rtype.__name__, result_keys(rtype)
+    return {
+        "method": method,
+        "variants": [m for m in bulk if m != method],
+        "returns": returns,
+        "return_keys": return_keys,
+    }
 
 
 def get_format_methods(cls) -> list:
@@ -385,8 +475,11 @@ def introspect_class(module_path: str, class_name: str, category: str) -> dict:
         "documentation_url": parsed.get("documentation_url"),
         "documentation_link": parsed.get("documentation_link"),
         "notebook": parsed.get("notebook"),
+        "openapi_url": parsed.get("openapi_url"),
+        "operations": parsed.get("operations", []),
         "setup_method": get_setup_method(cls),
         "setup_args_from_docstring": parsed.get("setup_args", []),
+        "constraints": parsed.get("constraints", []),
         "entity_fields": parsed.get("entity_fields", []),
         "entity_field_qualifiers": parsed.get("entity_field_qualifiers", {}),
         "entity_field_notes": parsed.get("entity_field_notes", []),
@@ -398,6 +491,9 @@ def introspect_class(module_path: str, class_name: str, category: str) -> dict:
 
     if "supported_operations" in parsed:
         entry["supported_operations"] = parsed["supported_operations"]
+
+    setup = entry["setup_method"]
+    entry["run_method"] = get_run_method(cls, setup["method_name"] if setup else None)
 
     entry["_sections_found"] = parsed.get("raw_sections_found", [])
     return entry
@@ -579,6 +675,7 @@ All extractors inherit from `BaseExtractor` (`src/earthdaily/agriculture/core/ba
 - **Output formatting** — rename, exclude, select columns via `configure_output()`
 - **Export format** — results write as CSV (default) or Parquet via `self.export_format`; see "Output Format" below
 - **Report generation** — optional HTML report via `generate_report=True` on any bulk method
+- **Rate limiting** — opt-in `rate_limit=` (calls/s, shared by all workers) on every bulk method; default `None` = no limit; see "API rate limiting" below
 - **Logging** — loguru-based, shared with WorkflowManager or standalone
 
 ### Extractor Workflow
@@ -599,7 +696,6 @@ __init__(token, config, workflow_ref) -> setup_<type>_parameters() -> get_<type>
 - **API response None handling** — use `response.get('key') or []` instead of `response.get('key', [])` when API may return explicit `None` values
 - **Minimal platform adherence** — entities can come from EarthDaily Agriculture platform or external datasets; avoid coupling to platform-specific field management
 - **Always pass `include_groups=` to `groupby().apply()`** — pandas 3.x silently DROPS the grouping column from the result (2.2 deprecated it; 3.x just does it). `df.groupby("k").apply(fn)` returns a frame with no `k` column, nothing raises, and the loss surfaces far downstream. Prefer `groupby().sample()` / `.agg()` / `.transform()`, which keep the column; use `apply(..., include_groups=False)` where apply is genuinely needed. Enforced by the `check-groupby-apply` pre-commit hook (`SeriesGroupBy` — `groupby("k")["col"].apply(...)` — is exempt, it has no grouping column to drop)
-- **`load_workflow()` returns the UNWRAPPED config** — for the new step format it hands back `raw["workflow"]`, so index `cfg["steps"]` / `cfg["settings"]` / `cfg["name"]`, never `cfg["workflow"]["steps"]` (bare `KeyError: 'workflow'`). The legacy `analytics:` format returns the wrapped dict instead, so the shape depends on the input. `manager.workflow_cfg` is the same object; `manager.workflow_cfg_raw` is the wrapped original
 
 ### Output Format (CSV / Parquet)
 
@@ -681,6 +777,46 @@ manifests stay openable by local readers. Unlike the manifest sidecar, a failed 
 write is **not** swallowed: it raises and the writer reports a normal per-entity error,
 because a manifest claiming a raster that only ever existed on the runner is worse than
 one that failed loudly.
+
+### API rate limiting (`rate_limit`, opt-in)
+
+Every extractor's bulk method accepts **`rate_limit`**: the most API calls per second that
+run starts, **shared by all `max_workers` threads**. Unset (the default) means no limit, so
+existing runs are unchanged. It applies to bulk runs only; single-entity calls are never
+throttled. Calls are spaced evenly (`1 / rate_limit` seconds apart).
+
+```python
+extractor.process_entity_weather_bulk_parallel(entities, max_workers=10, rate_limit=5)
+```
+
+```yaml
+# workflow.yml — per step: run.params keys the bulk method accepts are forwarded to it
+steps:
+  - name: weather
+    run:
+      method: process_entity_weather_bulk_parallel
+      params:
+        max_workers: 10
+        rate_limit: 5
+```
+
+Precedence: **the bulk call's `rate_limit=` (or `run.params.rate_limit`) > `extractor.rate_limit`
+> the class's `DEFAULT_RATE_LIMIT` > no limit.** There is deliberately **no global setting
+or env var**: each API has its own quota, so the limit is set per extractor / per step.
+
+How it is wired, for anyone adding an extractor: the public bulk method takes
+`rate_limit=None` and stores it first thing as `self._bulk_rate_limit`; the submit loop
+wraps its worker **once** with `paced = self._paced(self.process_single_entity_x)` and
+submits `paced`. Cache wrappers and spatial grouping need no change.
+`tests/test_rate_limit_extractors.py` fails if a thread pool submits an unpaced worker.
+
+What it counts: **HTTP requests per second, retries included**. `_paced` binds the run's
+limiter to the worker thread, and `retry_with_backoff_no_retry_on_400` takes a turn before
+every attempt (the first spends the token `_paced` already took). Several calls per entity
+(historical years, pagination, submit + result) are each paced. A 429 holds **every** worker
+of the run for the server's `Retry-After` (`RateLimiter.penalize`), not only the one that got
+it. A worker that does not use the retry helper is still paced once per entity. Two workflow
+steps running in parallel each have their own limit.
 
 ## Package Structure — `earthdaily.agriculture`
 
@@ -846,10 +982,137 @@ Credentials go in `src/.env` (copy from `src/template.env`):
 """
 
 
+def _render_choices(param: dict) -> str:
+    """``one of: none | duplicate | crop_coverage`` (+ ``, case-insensitive``)."""
+    text = "one of: " + " | ".join(str(c) for c in param["choices"])
+    return text + (", case-insensitive" if param.get("case_insensitive") else "")
+
+
+def _render_run_line(run: dict | None) -> str | None:
+    """The CLAUDE.md ``Run:`` value: entry method, its result type, the other bulk methods."""
+    if not run:
+        return None
+    if run["method"]:
+        text = f"`{run['method']}(entity_list, ...)`"
+        if run.get("returns"):
+            text += f" → `{run['returns']}`"
+        if run["variants"]:
+            text += " · also: " + ", ".join(f"`{v}`" for v in run["variants"])
+        return text
+    return "no single entry point — one of " + ", ".join(f"`{v}`" for v in run["variants"])
+
+
+# ---------------------------------------------------------------------------
+# workflow.yml schema (services/workflow_schema.py) -> cards and doc 09b
+# ---------------------------------------------------------------------------
+
+#: Where each workflow.yml block sits, for the tables' headings.
+WORKFLOW_BLOCK_TITLES = {
+    "workflow": "`workflow:` (top level)",
+    "settings": "`settings:`",
+    "step": "`steps:` items",
+    "call": "`setup:` / `run:`",
+    "transform": "`transform:`",
+    "condition": "`condition:`",
+    "entity_source": "`entity_source:`",
+}
+WORKFLOW_DOC_PATH = Path("docs/site/agriculture/09b - Workflow_YAML_reference.md")
+WORKFLOW_DOC_BEGIN = (
+    "<!-- BEGIN GENERATED: workflow-keys (generate_ai_context.py from services/workflow_schema.py; do not edit) -->"
+)
+WORKFLOW_DOC_END = "<!-- END GENERATED: workflow-keys -->"
+
+
+def _schema_type(annotation) -> str:
+    """A readable type for a schema key: Literal values, block names, `list of ...`."""
+    origin = typing.get_origin(annotation)
+    if origin is typing.Literal:
+        return " or ".join(f"`{v}`" for v in typing.get_args(annotation))
+    for name, block in WORKFLOW_BLOCKS.items():
+        if annotation is block:
+            return f"{name} block"
+    if origin is list:
+        return "list of " + _schema_type(typing.get_args(annotation)[0])
+    if origin in (typing.Union, getattr(__import__("types"), "UnionType", None)):
+        return " or ".join(_schema_type(a) for a in typing.get_args(annotation))
+    if origin is dict:
+        return "mapping"
+    return getattr(annotation, "__name__", str(annotation))
+
+
+def workflow_schema_rows() -> dict[str, list[tuple[str, str, str]]]:
+    """``{block: [(key, type, doc), ...]}`` in declaration order."""
+    rows = {}
+    for block, typed in WORKFLOW_BLOCKS.items():
+        hints = typing.get_type_hints(typed)
+        rows[block] = [(key, _schema_type(hints[key]), WORKFLOW_KEY_DOCS[block][key]) for key in typed.__annotations__]
+    return rows
+
+
+def render_workflow_tables(heading_level: int = 3) -> list[str]:
+    """Markdown tables of every workflow.yml block, plus the reserved run.params keys."""
+    h = "#" * heading_level
+    out: list[str] = []
+    for block, rows in workflow_schema_rows().items():
+        out += [f"{h} {WORKFLOW_BLOCK_TITLES[block]}", "", "| Key | Type | What it does |", "|---|---|---|"]
+        out += [f"| `{k}` | {t} | {d} |" for k, t, d in rows]
+        out.append("")
+    out += [
+        f"{h} `run.params` keys WorkflowManager keeps",
+        "",
+        "Every other key in `run.params` is passed to the bulk method as a keyword argument.",
+        "",
+        "| Key | Default | What it does |",
+        "|---|---|---|",
+    ]
+    out += [f"| `{k}` | {default} | {doc} |" for k, (default, doc) in RUN_PARAMS_RESERVED.items()]
+    out.append("")
+    return out
+
+
+def render_workflow_claude_section() -> list[str]:
+    """Compact WorkflowManager section for CLAUDE.md: keys per block, reserved run.params, traps."""
+    out = [
+        "## Workflow YAML (auto-generated)",
+        "",
+        "`WorkflowManager.load_workflow()` reads these keys (schema: `services/workflow_schema.py`) and warns,",
+        "with a suggestion, about any other key.",
+        "",
+    ]
+    for block, rows in workflow_schema_rows().items():
+        out.append(f"- **{WORKFLOW_BLOCK_TITLES[block]}** " + ", ".join(f"`{k}`" for k, _, _ in rows))
+    out.append(
+        "- **`run.params` kept by WorkflowManager** "
+        + ", ".join(f"`{k}`" for k in RUN_PARAMS_RESERVED)
+        + "; others go to the bulk method"
+    )
+    out += ["", "**Traps:**", ""] + [f"- {t}" for t in TRAPS] + [""]
+    return out
+
+
+def update_workflow_doc(root: Path) -> bool:
+    """Rewrite the generated key tables inside doc 09b, between its markers. True if changed."""
+    path = root / WORKFLOW_DOC_PATH
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8")
+    if WORKFLOW_DOC_BEGIN not in text or WORKFLOW_DOC_END not in text:
+        return False
+    head, rest = text.split(WORKFLOW_DOC_BEGIN, 1)
+    _, tail = rest.split(WORKFLOW_DOC_END, 1)
+    body = "\n".join(render_workflow_tables(heading_level=3))
+    new = f"{head}{WORKFLOW_DOC_BEGIN}\n\n{body}\n{WORKFLOW_DOC_END}{tail}"
+    if new != text:
+        path.write_text(new, encoding="utf-8")
+        return True
+    return False
+
+
 def generate_claude_md(entries: list) -> str:
     """Generate CLAUDE.md with static header + auto-generated extractor reference."""
     lines = [CLAUDE_MD_HEADER.strip()]
     lines.append("")
+    lines += render_workflow_claude_section()
     lines.append("## Extractor Reference (auto-generated)")
     lines.append("")
     lines.append(f"<!-- Generated by generate_ai_context.py on {datetime.now().strftime('%Y-%m-%d %H:%M')} -->")
@@ -880,6 +1143,10 @@ def generate_claude_md(entries: list) -> str:
                 lines.append(f"- **Docs:** {e['documentation_url']}")
             if e.get("notebook"):
                 lines.append(f"- **Notebook:** `{e['notebook']}`")
+            if e.get("openapi_url"):
+                lines.append(f"- **OpenAPI:** {e['openapi_url']}")
+            if e.get("operations"):
+                lines.append(f"- **Operation:** {' · '.join(f'`{op}`' for op in e['operations'])}")
 
             # Setup method + key params
             setup = e.get("setup_method")
@@ -888,13 +1155,20 @@ def generate_claude_md(entries: list) -> str:
                 if key_params:
                     param_strs = []
                     for p in key_params:
-                        s = f"`{p['name']}`"
+                        details = []
                         if p["default"] is not None:
-                            s += f" (default: {p['default']})"
+                            details.append(f"default: {p['default']}")
+                        if p.get("choices"):
+                            details.append(_render_choices(p))
+                        s = f"`{p['name']}`" + (f" ({'; '.join(details)})" if details else "")
                         param_strs.append(s)
                     lines.append(f"- **Setup:** `{setup['method_name']}()` — {', '.join(param_strs)}")
                 else:
                     lines.append(f"- **Setup:** `{setup['method_name']}()`")
+
+            run_line = _render_run_line(e.get("run_method"))
+            if run_line:
+                lines.append(f"- **Run:** {run_line}")
 
             if e.get("entity_fields"):
                 qualifiers = e.get("entity_field_qualifiers") or {}
@@ -903,10 +1177,17 @@ def generate_claude_md(entries: list) -> str:
 
             if e.get("output_columns"):
                 cols = e["output_columns"]
+                # Every extractor keeps the caller's input columns through core.api_utils.
+                # normalize_with_metadata (tests/test_input_columns_kept.py), except `geometry`,
+                # which BaseExtractor.exclude_columns drops by default. The docstring lists what it adds.
+                label = "Output columns (added to your input columns, minus `geometry`"
                 if len(cols) <= 8:
-                    lines.append(f"- **Output columns:** {', '.join(f'`{c}`' for c in cols)}")
+                    lines.append(f"- **{label}):** {', '.join(f'`{c}`' for c in cols)}")
                 else:
-                    lines.append(f"- **Output columns ({len(cols)}):** {', '.join(f'`{c}`' for c in cols[:8])}, ...")
+                    lines.append(f"- **{label}; {len(cols)}):** {', '.join(f'`{c}`' for c in cols[:8])}, ...")
+
+            if e.get("constraints"):
+                lines.append(f"- **Constraints:** {' '.join(e['constraints'])}")
 
             if e.get("supported_operations"):
                 lines.append(f"- **Operations:** {', '.join(e['supported_operations'])}")
@@ -940,6 +1221,18 @@ def generate_agents_md(entries: list, tracked_links: bool = False) -> str:
     lines.append("")
     lines.append("---")
     lines.append("")
+    lines.append("## WorkflowManager — workflow.yml")
+    lines.append("")
+    lines.append("**Import:** `from earthdaily.agriculture.services.workflow_manager import WorkflowManager`  ")
+    lines.append("**Schema:** `earthdaily.agriculture.services.workflow_schema` (unknown keys are reported at load)")
+    lines.append("")
+    lines.append("### Traps")
+    lines.append("")
+    lines += [f"- {t}" for t in TRAPS]
+    lines.append("")
+    lines += render_workflow_tables(heading_level=3)
+    lines.append("---")
+    lines.append("")
 
     for entry in sorted(entries, key=lambda x: x["class_name"]):
         if "error" in entry:
@@ -965,6 +1258,10 @@ def generate_agents_md(entries: list, tracked_links: bool = False) -> str:
             lines.append(f"**API Docs:** {docs or entry['documentation_url']}  ")
         if entry.get("notebook"):
             lines.append(f"**Notebook:** `{entry['notebook']}`  ")
+        if entry.get("openapi_url"):
+            lines.append(f"**OpenAPI:** {entry['openapi_url']}  ")
+        if entry.get("operations"):
+            lines.append(f"**Operation:** {' · '.join(f'`{op}`' for op in entry['operations'])}  ")
         lines.append("")
 
         # Setup method with full param table
@@ -974,11 +1271,26 @@ def generate_agents_md(entries: list, tracked_links: bool = False) -> str:
             lines.append("")
             params = [p for p in setup["parameters"] if p["name"] not in COMMON_SETUP_PARAMS]
             if params:
-                lines.append("| Parameter | Default |")
-                lines.append("|---|---|")
+                # The "Allowed values" column only appears once an extractor declares
+                # Literal hints, so cards not yet migrated keep their two-column table.
+                with_choices = any(p.get("choices") for p in params)
+                if with_choices:
+                    lines.append("| Parameter | Default | Allowed values |")
+                    lines.append("|---|---|---|")
+                else:
+                    lines.append("| Parameter | Default |")
+                    lines.append("|---|---|")
                 for p in params:
                     default = p["default"] if p["default"] is not None else "*required*"
-                    lines.append(f"| `{p['name']}` | {default} |")
+                    if with_choices:
+                        # Commas, not " | ": a pipe would split the table cell.
+                        allowed = ""
+                        if p.get("choices"):
+                            allowed = ", ".join(f"`{c}`" for c in p["choices"])
+                            allowed += " (case-insensitive)" if p.get("case_insensitive") else ""
+                        lines.append(f"| `{p['name']}` | {default} | {allowed} |")
+                    else:
+                        lines.append(f"| `{p['name']}` | {default} |")
                 lines.append("")
 
             # Docstring args with descriptions (richer than signature alone)
@@ -987,7 +1299,8 @@ def generate_agents_md(entries: list, tracked_links: bool = False) -> str:
                 lines.append("**Parameter details:**")
                 for a in doc_args:
                     desc = a["description"]
-                    default_note = f" Default: {a['default']}" if a.get("default") else ""
+                    # The parser strips the description's final period; put it back before "Default:".
+                    default_note = f". Default: {a['default']}" if a.get("default") else ""
                     lines.append(f"- `{a['name']}` ({a['type']}): {desc}{default_note}")
                 lines.append("")
 
@@ -1007,12 +1320,51 @@ def generate_agents_md(entries: list, tracked_links: bool = False) -> str:
                 lines.append(f"- _{note}_")
             lines.append("")
 
+        # Run: which bulk method to call, and what it returns
+        run = entry.get("run_method")
+        if run:
+            lines.append("### Run")
+            lines.append("")
+            if run["method"]:
+                lines.append(f"`{run['method']}(entity_list, ...)`")
+                if run["variants"]:
+                    lines.append("")
+                    lines.append(f"Other bulk methods: {', '.join(f'`{v}()`' for v in run['variants'])}")
+            else:
+                lines.append(
+                    f"No single entry point — call one of {', '.join(f'`{v}()`' for v in run['variants'])} "
+                    "(see the class docstring for the order)."
+                )
+            lines.append("")
+            if run.get("return_keys"):
+                lines.append(f"Returns `{run['returns']}` (`earthdaily.agriculture.core.results`):")
+                lines.append("")
+                for key in run["return_keys"]:
+                    doc = KEY_DOCS[key]
+                    tag = "" if key in CORE_KEYS else " *(optional)*"
+                    lines.append(f"- `{key}`{tag} — {doc}")
+                lines.append("")
+
         # Output columns
         if entry.get("output_columns"):
             lines.append("### Output Columns")
             lines.append("")
+            lines.append(
+                "The result keeps every column of your input table except `geometry` (dropped by default; "
+                "pass `exclude_columns=[]` to setup to keep it), with list values joined as comma-separated "
+                "strings. These columns are added:"
+            )
+            lines.append("")
             for c in entry["output_columns"]:
                 lines.append(f"- `{c}`")
+            lines.append("")
+
+        # Constraints between parameters
+        if entry.get("constraints"):
+            lines.append("### Constraints")
+            lines.append("")
+            for c in entry["constraints"]:
+                lines.append(f"- {c}")
             lines.append("")
 
         # Methods
@@ -1068,7 +1420,7 @@ Generated EarthDaily Agriculture extraction project. Uses the local `earthdaily.
 
 ## Use the `/earthdaily-agriculture` skill for extractor work
 
-`.claude/skills/earthdaily-agriculture/SKILL.md` contains the extractor catalogue, paste-ready setup snippets, the YAML step recipe, and common pitfalls. The full per-extractor reference (params, output columns, methods) sits next to it in `extractors.md`.
+`.claude/skills/earthdaily-agriculture/SKILL.md` contains the extractor catalog, paste-ready setup snippets, the YAML step recipe, and common pitfalls. The full per-extractor reference (params, output columns, methods) sits next to it in `extractors.md`.
 
 ## Bundled reference docs
 
@@ -1134,7 +1486,7 @@ See `docs/14 - Deployment_patterns.md` for the full Pattern A (GH Actions cron) 
 
 SKILL_MD_HEADER = """---
 name: earthdaily-agriculture
-description: Use when picking an EarthDaily Agriculture extractor, configuring its parameters, wiring it into a WorkflowManager pipeline, or rebuilding/refreshing the local earthdaily.agriculture wheel in dist/. Covers the extractor catalogue, paste-ready setup snippets, YAML workflow recipes, and common pitfalls.
+description: Use when picking an EarthDaily Agriculture extractor, configuring its parameters, wiring it into a WorkflowManager pipeline, or rebuilding/refreshing the local earthdaily.agriculture wheel in dist/. Covers the extractor catalog, paste-ready setup snippets, YAML workflow recipes, and common pitfalls.
 ---
 
 # /earthdaily-agriculture — EarthDaily Agriculture extractor recipes
@@ -1223,7 +1575,7 @@ For the canonical, always-current reference, point the user at:
 - `<earthdaily-agriculture-internal>/agents.md` — per-extractor agent cards (params, output columns, methods).
 - `<earthdaily-agriculture-internal>/docs/site/agriculture/` — public-facing numbered docs (`01 - Quick_Start_Guide.md`, `03 - Extractor_parameters_reference.md`, `09 - Workflow_architecture.md`, `13 - Cloud_storage_principles_and_usage.md`, `14 - Deployment_patterns.md`, etc.). Internal docs (release pipeline design, repo changelog) live under `<earthdaily-agriculture-internal>/docs/internal/` and are not part of the public package.
 
-For the per-extractor catalogue current at the time this skill was generated, see `extractors.md` next to this file.
+For the per-extractor catalog current at the time this skill was generated, see `extractors.md` next to this file.
 
 ## Mental model — the 5-method extractor lifecycle
 
@@ -1422,7 +1774,7 @@ def generate_personal_skill_md(entries: list, runbook_pointers: str = "") -> str
     lines.append("")
     lines.append(f"<!-- Generated by generate_ai_context.py on {datetime.now().strftime('%Y-%m-%d %H:%M')} -->")
     lines.append("")
-    lines.append("## Extractor catalogue (snapshot — see extractors.md for full detail)")
+    lines.append("## Extractor catalog (snapshot — see extractors.md for full detail)")
     lines.append("")
     lines.append("| Category | Extractor | What it does |")
     lines.append("|---|---|---|")
@@ -1766,7 +2118,7 @@ def main():
             print(f"  runbooks/{name}")
         for name in runbooks_skipped:
             print(f"  (skipped, internal) runbooks/{name}")
-        print(f"\nExtractors catalogued: {len(entries)} ({errors} errors)")
+        print(f"\nExtractors cataloged: {len(entries)} ({errors} errors)")
         print(
             "\nInstall hint: Claude Code auto-loads personal skills from "
             "~/.claude/skills/. If you generated into a different path, copy or "
@@ -1796,6 +2148,10 @@ def main():
         return
 
     # ── Repo mode: write the repo-level CLAUDE.md, agents.md, gap report ──
+    # Doc 09b's key tables are generated from services/workflow_schema.py (between markers).
+    repo_root = Path(args.claude_md).resolve().parent
+    if update_workflow_doc(repo_root):
+        print(f"  09b key tables -> {repo_root / WORKFLOW_DOC_PATH}")
     for path, content in [
         (args.claude_md, claude_md),
         (args.agents_md, agents_md),

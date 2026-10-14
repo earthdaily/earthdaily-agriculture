@@ -886,7 +886,7 @@ def column_stats(df, column, top_n=10):
     min, max, quartiles.  Always includes top-N value counts.
 
     Args:
-        df:      DataFrame to analyse.
+        df:      DataFrame to analyze.
         column:  Column name.
         top_n:   Number of top values to show.
 
@@ -972,7 +972,7 @@ def grouped_stats(df, column, groupby, decimals=4):
 
     Args:
         df:       DataFrame.
-        column:   Column to analyse.
+        column:   Column to analyze.
         groupby:  Column to group by (becomes the table columns).
         decimals: Rounding precision for numeric stats.
 
@@ -1086,7 +1086,7 @@ def crosstab_chart(df, row_col, col_col, normalize=False):
         df:        DataFrame.
         row_col:   Column for the heatmap rows.
         col_col:   Column for the heatmap columns.
-        normalize: If True show percentages (column-normalised) instead of counts.
+        normalize: If True show percentages (column-normalized) instead of counts.
     """
     if row_col not in df.columns or col_col not in df.columns:
         print(f"Column '{row_col}' or '{col_col}' not found.")

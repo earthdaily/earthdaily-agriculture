@@ -84,7 +84,7 @@ class TestIsRemotePath:
 class TestJoinPath:
     def test_local_uses_os_join(self, tmp_path):
         out = join_path(tmp_path, "a", "b.csv")
-        # os.path.join honours the platform separator; just check segments are present.
+        # os.path.join honors the platform separator; just check segments are present.
         assert "a" in str(out) and "b.csv" in str(out)
 
     def test_remote_concatenates_with_forward_slash(self):
@@ -183,7 +183,7 @@ class TestStorageOptionsForAzure:
     def test_account_name_plus_sas(self, _clean_azure_env):
         _clean_azure_env.setenv("AZURE_STORAGE_ACCOUNT_NAME", "acct")
         _clean_azure_env.setenv("AZURE_STORAGE_SAS_TOKEN", "?sv=2026&sig=abc")
-        # leading '?' is normalised off
+        # leading '?' is normalized off
         assert storage_options_for("az://c/p") == {"account_name": "acct", "sas_token": "sv=2026&sig=abc"}
 
     def test_account_name_plus_key(self, _clean_azure_env):
@@ -213,7 +213,7 @@ class TestStorageOptionsForAzure:
 
 
 class TestExportResultsLocalRoundtrip:
-    """Local-path behaviour must be byte-identical to the pre-refactor version."""
+    """Local-path behavior must be byte-identical to the pre-refactor version."""
 
     def test_writes_results_csv(self, tmp_path):
         from earthdaily.agriculture.core.api_utils import export_results

@@ -1,5 +1,5 @@
 """
-Tests for field-file ingestion: geometry normalisation
+Tests for field-file ingestion: geometry normalization
 (``core.geometry.normalize_field_geometry``) and the row-level defaulting in
 ``EntityManager.prepare_field_dataframe``.
 

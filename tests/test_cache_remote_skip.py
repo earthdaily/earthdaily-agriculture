@@ -1,4 +1,4 @@
-"""Tests for the cache-disable-on-remote-cache-dir behaviour introduced
+"""Tests for the cache-disable-on-remote-cache-dir behavior introduced
 on the feat/s3-fsspec-writers branch.
 
 The local-only atomic-rename in BaseExtractor._update_cache cannot run on
@@ -95,7 +95,7 @@ class TestApplyCacheSettingRespectsRemoteDir:
 
     def test_apply_cache_setting_false_on_remote_still_works(self, fake_config_remote):
         ext = _make_extractor(fake_config_remote)
-        # Disabling is always honoured.
+        # Disabling is always honored.
         ext.apply_cache_setting(use_cache=False)
         assert ext.use_cache is False
 

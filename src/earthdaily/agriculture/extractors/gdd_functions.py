@@ -5,13 +5,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
 
+# Internal
+from typing import Literal
+
 import pandas as pd
 
 # Third-Party
 import requests
 from tqdm import tqdm
 
-# Internal
 from earthdaily.agriculture.config.urls import agro_urls
 from earthdaily.agriculture.core.api_utils import (
     export_results,
@@ -25,11 +27,14 @@ from earthdaily.agriculture.core.base_extractor import (
     BaseExtractor,
     requires_token,
 )
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import get_centroid_wkt, validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import SpatialBulkResult
 
 # --- Valid values ---
-VALID_PROVIDERS = {"GLOBAL1"}
+# Allowed values, read by the validator and by generate_ai_context.
+GddProvider = Literal["GLOBAL1"]
 
 
 def require_gdd_params(func):
@@ -54,13 +59,13 @@ class GDDExtractor(BaseExtractor):
     output is a long DataFrame: one row per entity per day, with columns for
     minimum/maximum temperature, daily GDD and cumulated GDD.
 
-    Endpoint: ``{weather_url}/analytics/gdd``
-
     Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgro_growing_degree_days.ipynb
+    OpenAPI: https://api.geosys-na.net/Weather/v1/swagger/v2.0/swagger.json
+    Operation: GET /analytics/gdd
 
     Args (setup_gdd_parameters):
-        provider (str): Weather data provider. Default: 'GLOBAL1'
+        provider (GddProvider): Weather data provider. Default: 'GLOBAL1'
         lower_threshold (float): Lower GDD temperature threshold (required by API). Default: 10.0
         upper_threshold (float): Optional upper temperature threshold (capped GDD). Default: None
         start_date (str): Period start in YYYY-MM-DD (maps to API StartDate). Default: None
@@ -77,6 +82,10 @@ class GDDExtractor(BaseExtractor):
 
     Output columns:
         entity_id, date, minimum, maximum, daily_gdd, cumulated_gdd
+
+    Constraints:
+        - lower_threshold must be below upper_threshold (when upper_threshold is set).
+        - start_date must not be after end_date.
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -101,7 +110,7 @@ class GDDExtractor(BaseExtractor):
     @requires_token
     def setup_gdd_parameters(
         self,
-        provider="GLOBAL1",
+        provider: GddProvider = "GLOBAL1",
         lower_threshold=10.0,
         upper_threshold=None,
         start_date=None,
@@ -119,7 +128,7 @@ class GDDExtractor(BaseExtractor):
         Configure parameters for GDD extraction.
 
         Args:
-            provider (str): Weather data provider (default ``'GLOBAL1'``).
+            provider (GddProvider): Weather data provider (default ``'GLOBAL1'``).
             lower_threshold (float): Lower GDD temperature threshold (required by API).
             upper_threshold (float, optional): Upper GDD temperature threshold.
             start_date (str, optional): Start date (``YYYY-MM-DD``). Can be
@@ -136,8 +145,7 @@ class GDDExtractor(BaseExtractor):
             use_cache (bool, optional): Per-call cache override.
         """
         # Provider validation
-        if provider not in VALID_PROVIDERS:
-            raise ValueError(f"Invalid provider '{provider}'. Must be one of {VALID_PROVIDERS}.")
+        provider = self._check_choice("provider", provider, GddProvider)
 
         # Threshold validation
         if not isinstance(lower_threshold, (int, float)) or isinstance(lower_threshold, bool):
@@ -395,7 +403,7 @@ class GDDExtractor(BaseExtractor):
         if params is None:
             params = self.gdd_params
 
-        # Normalise row to dict
+        # Normalize row to dict
         try:
             if isinstance(row, pd.DataFrame):
                 if len(row) > 1:
@@ -454,7 +462,7 @@ class GDDExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="gdd",
         generate_report=False,
@@ -463,7 +471,8 @@ class GDDExtractor(BaseExtractor):
         spatial_grouping=False,
         spatial_precision=DEFAULT_SPATIAL_PRECISION,
         spatial_max_window_days=DEFAULT_MAX_WINDOW_DAYS,
-    ):
+        rate_limit=None,
+    ) -> SpatialBulkResult:
         """
         Bulk GDD extraction with threading, partial saves, and merge logic.
 
@@ -475,7 +484,7 @@ class GDDExtractor(BaseExtractor):
                 provider``, call the API once per group over the *union* of the
                 group's date windows, and slice each member out of that single
                 response. GDD depends only on the centroid + date window +
-                thresholds, so neighbouring fields dedup safely. ``cumulated_gdd``
+                thresholds, so neighboring fields dedup safely. ``cumulated_gdd``
                 accumulates from the *request* start, so each member's series is
                 re-zeroed to its own start date (year by year when
                 ``reset_cumulative_every_year`` is set) — the output matches an
@@ -487,7 +496,12 @@ class GDDExtractor(BaseExtractor):
                 ``DEFAULT_MAX_WINDOW_DAYS``). Cells whose union exceeds it are split
                 into sub-groups, so one long-history field cannot force a decade-long
                 pull on every field sharing its cell.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
         """
+
+        self._bulk_rate_limit = rate_limit  # read by _paced()
 
         def _dispatch(
             el, *, skip_export_=skip_export, generate_report_=generate_report, report_options_=report_options
@@ -594,8 +608,7 @@ class GDDExtractor(BaseExtractor):
 
         if merge_existing is None:
             merge_existing = self.merge_existing
-        if merge_existing not in ("auto", "preserve", "mark"):
-            raise ValueError(f"Invalid merge_existing='{merge_existing}'. Choose from ['auto','preserve','mark']")
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         filtered, skipped, skip_count = filter_entities(entity_list, filter_column, filter_value, filter_type)
 
@@ -616,10 +629,11 @@ class GDDExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_gdd)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_gdd, row, params): self.get_entity_value(row, "id")
-                for _, row in filtered.iterrows()
+                executor.submit(paced, row, params): self.get_entity_value(row, "id") for _, row in filtered.iterrows()
             }
 
             with tqdm(

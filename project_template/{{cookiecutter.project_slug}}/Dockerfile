@@ -1,43 +1,46 @@
 # {{ cookiecutter.project_name }} — container image
 #
-# Mirrors the local earthdaily-agriculture install so the same code runs in CI, on
-# ECS / Cloud Run / Argo, or under `docker run`. See docs/14 -
-# Deployment_patterns.md (Pattern B) for invocation patterns.
+# The general-purpose image: `docker run`, scheduled jobs, CI. For large stateless runs
+# use `Dockerfile.headless` (leaner, and refuses to write to the container's own disk).
+# See docs/14 - Deployment_patterns.md (Pattern B) for invocation patterns.
 #
-# Multi-stage build keeps the runtime image around 600 MB. Single-stage
-# alternative (~1.2 GB) below in a comment if you need to debug a build.
+# A client project is NOT a Python package — it has no pyproject.toml / src/ of its
+# own. The image installs the project's requirements.txt (earthdaily-agriculture from
+# PyPI, or the wheel in dist/ when scaffolded with --use-local-wheel) and runs the
+# project's own app/ code.
 
-# ---- Stage 1: build wheel ----
-FROM python:{{ cookiecutter.python_version }}-slim AS builder
-WORKDIR /build
-COPY pyproject.toml requirements.txt ./
-COPY src/ ./src/
-RUN pip install --no-cache-dir build && python -m build --wheel
-
-# ---- Stage 2: runtime ----
 FROM python:{{ cookiecutter.python_version }}-slim
+
+# The rasterio / pyogrio / shapely / pyproj wheels bundle their own GDAL / GEOS / PROJ,
+# so no system GDAL — its package name (libgdal32, libgdal36, ...) changes with every
+# Debian release and broke this image once already. The bundled GDAL still needs
+# libexpat at import; that name is stable across releases.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgdal32 \
+        libexpat1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the wheel built in stage 1, then earthdaily-agriculture.
-COPY --from=builder /build/dist/*.whl /tmp/
-{% if cookiecutter.edagro_install_mode == 'wheel' %}
-# Local wheel — requires dist/ to be present in the build context.
-COPY dist/earthdaily_agriculture-{{ cookiecutter.edagro_wheel_version }}-py3-none-any.whl /tmp/
-RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl
-{% else %}
-RUN pip install --no-cache-dir /tmp/*.whl \
-    && pip install --no-cache-dir earthdaily-agriculture=={{ cookiecutter.edagro_wheel_version }} \
-    && rm /tmp/*.whl
-{% endif %}
+WORKDIR /app
 
-# Non-root user — required by many orchestrators (Cloud Run, OpenShift).
-RUN useradd --create-home --shell /bin/bash edagro
+# Dependencies first, for layer caching. dist/ is copied in both install modes: it
+# holds the pinned wheel in `wheel` mode and only .gitkeep otherwise.
+COPY requirements.txt ./
+COPY dist/ ./dist/
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Runtime code only; notebooks, docs and .env are excluded by .dockerignore.
+COPY app/ ./app/
+COPY configuration/ ./configuration/
+
+# Non-root user, as most schedulers and restricted container runtimes require. /app must
+# be writable: with no pyproject.toml here the package resolves the project root to the
+# working directory and creates results/, logs/ etc. there.
+RUN useradd --create-home --shell /bin/bash edagro && chown -R edagro /app
 USER edagro
-WORKDIR /home/edagro
 
-# Default command runs the pipeline; orchestrators can override with --shard,
-# --limit, etc. The image's stdout is the log stream when EDAGRO_LOG_CONSOLE_ONLY=1.
+# Console-only logs so the scheduler captures stdout as the log stream.
+ENV EDAGRO_LOG_CONSOLE_ONLY=1
+
+# Callers pass --prefix / --shard / --num-shards / --limit;
+# `docker run <image> --help` prints usage.
 ENTRYPOINT ["python", "-m", "app.run_pipeline"]
 CMD ["--help"]

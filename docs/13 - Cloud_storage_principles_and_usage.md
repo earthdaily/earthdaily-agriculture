@@ -49,7 +49,7 @@ manager.config["partial_result_dir"] = "s3://my-bucket/runs/2026-05-09/partials"
 
 The extractor doesn't know or care. Internally, every writer routes through fsspec when it sees an `s3://` or `az://` prefix; through `pandas.to_csv` / `Path.write_text` for everything else.
 
-> **GCS is recognised but not supported yet.** `gs://` and `gcs://` are in the writer's scheme list, but **no published extra installs `gcsfs`**, so a `gs://` path fails with an fsspec backend error unless you install it yourself. Treat GCS as untested until a `gcs` extra ships.
+> **GCS is recognized but not supported yet.** `gs://` and `gcs://` are in the writer's scheme list, but **no published extra installs `gcsfs`**, so a `gs://` path fails with an fsspec backend error unless you install it yourself. Treat GCS as untested until a `gcs` extra ships.
 
 **Why this matters:** every extractor — current and future — gains S3 support for free. There's no per-extractor wiring to maintain and no risk of one extractor's S3 path drifting from another's.
 
@@ -63,7 +63,7 @@ The mechanism: `WorkflowManager` instantiates a boto3 client at construction tim
 
 ### 3. Credentials follow the standard chain — always
 
-There's no EarthDaily Agriculture-specific cloud credentials API. Reads and writes both honour the chain that AWS SDKs already use:
+There's no EarthDaily Agriculture-specific cloud credentials API. Reads and writes both honor the chain that AWS SDKs already use:
 
 1. Explicit env vars (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`)
 2. `.env` file at your project root (loaded by `setup_environment` via `python-dotenv`; it also accepts `src/.env`, which is where a repository checkout keeps credentials beside the source)
@@ -110,7 +110,7 @@ The reason: `_update_cache` uses an atomic-rename pattern (`tempfile + Path.repl
 
 ### 6. Logs follow a different policy from data outputs
 
-Data outputs (results, partials, etc.) work on `s3://` paths. **Logs do not** — the `log_dir` argument to `setup_logging` is local-only by design. For containerised runs there's a separate switch:
+Data outputs (results, partials, etc.) work on `s3://` paths. **Logs do not** — the `log_dir` argument to `setup_logging` is local-only by design. For containerized runs there's a separate switch:
 
 - `EDAGRO_LOG_CONSOLE_ONLY=1` env var, or
 - `WorkflowManager(..., log_to_console_only=True)` kwarg
@@ -126,7 +126,7 @@ Three independent switches enable cloud storage, all default-off:
 | Switch | Where | Default |
 |---|---|---|
 | Path string `s3://...` in `manager.config` | Notebook / script / YAML | `<project-root>/results` |
-| `EDAGRO_OUTPUT_PREFIX=s3://...` env var | Process env (orchestrator) — honoured by `WorkflowManager`, `setup_environment()` and directly-built extractors | unset |
+| `EDAGRO_OUTPUT_PREFIX=s3://...` env var | Process env (orchestrator) — honored by `WorkflowManager`, `setup_environment()` and directly-built extractors | unset |
 | `storage=` kwarg | `WorkflowManager(..., storage=...)`, `setup_environment(..., storage=...)` | `"auto"` (env var wins if set) |
 | `[s3]` extra (`s3fs`, `fsspec`) | `pip install -e ".[s3]"` | not pulled by `[test]` or `[jupyter]` |
 | `[azure]` extra (`adlfs`, `fsspec`) | `pip install -e ".[azure]"` | not installed |
@@ -171,7 +171,7 @@ manager = WorkflowManager("prod", storage="local")
 ```
 
 `storage` is a `Literal["auto", "local", "s3"]` kwarg; the default `"auto"` is
-the existing behaviour (env var wins if set, otherwise local).
+the existing behavior (env var wins if set, otherwise local).
 
 ### Recipe B — Real AWS S3
 
@@ -498,7 +498,7 @@ CI runs the same tests on every PR via `.github/workflows/cloud-writers.yml` so 
 
 ## Where to look in the code
 
-If you're debugging or want to confirm a specific behaviour:
+If you're debugging or want to confirm a specific behavior:
 
 | Concern | File |
 |---|---|

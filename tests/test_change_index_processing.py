@@ -334,7 +334,7 @@ class TestProcessSingleEntityChangeIndexExtras:
 
 
 class TestBulkChangeIndexFilterType:
-    """Bulk filter_type behaviour — parity with the other suites."""
+    """Bulk filter_type behavior — parity with the other suites."""
 
     @patch("earthdaily.agriculture.processors.processor_change_index_functions.export_results")
     @patch.object(ChangeIndexExtractor, "process_single_entity_change_index")

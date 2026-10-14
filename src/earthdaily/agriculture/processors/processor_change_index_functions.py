@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
+from typing import Literal
 
 import pandas as pd
 
@@ -22,10 +23,12 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
-AVAILABLE_MAP_TYPES = {"NDVI", "EVI", "CVI", "GNDVI", "NDWI"}
+ChangeIndexMapType = Literal["NDVI", "EVI", "CVI", "GNDVI", "NDWI"]
 AVAILABLE_COLLECTIONS = {"Sentinel-2", "Landsat"}
 
 
@@ -53,10 +56,11 @@ class ChangeIndexExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Change_Index/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_ChangeIndex.ipynb
+    OpenAPI: https://change-index.aws.geosys.com/openapi.json
+    Operation: POST /change-index-processor
 
     Args (setup_change_index_parameters):
-        map_type (str): Vegetation index to analyze. Default: 'NDVI'.
-            Choices: NDVI, EVI, CVI, GNDVI, NDWI.
+        map_type (ChangeIndexMapType): Vegetation index to analyze. Default: 'NDVI'.
         collections (list[str]): Satellite collections to search. Default: ['Sentinel-2'].
             Choices: 'Sentinel-2', 'Landsat'.
         max_period_reference (int): Max days back from reference_date to find the reference image. Default: 7.
@@ -74,6 +78,9 @@ class ChangeIndexExtractor(BaseExtractor):
 
     Output columns:
         entity_id, reference_date, status, + any change metrics returned by the API
+
+    Constraints:
+        - min_period_previous must be strictly less than max_period_previous.
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -96,7 +103,7 @@ class ChangeIndexExtractor(BaseExtractor):
 
     def setup_change_index_parameters(
         self,
-        map_type="NDVI",
+        map_type: ChangeIndexMapType = "NDVI",
         collections=None,
         max_period_reference=7,
         max_period_previous=15,
@@ -115,7 +122,7 @@ class ChangeIndexExtractor(BaseExtractor):
         Configure parameters for change index extraction.
 
         Args:
-            map_type (str): Vegetation index (NDVI, EVI, CVI, GNDVI, NDWI). Default: 'NDVI'.
+            map_type (ChangeIndexMapType): Vegetation index. Default: 'NDVI'.
             collections (list[str]): Satellite collections. Default: ['Sentinel-2'].
             max_period_reference (int): Max days back from reference_date for reference image. Default: 7.
             max_period_previous (int): Max days before reference image for previous image. Default: 15.
@@ -137,10 +144,7 @@ class ChangeIndexExtractor(BaseExtractor):
         log.info("Configuring change index parameters...")
 
         # Map type validation
-        if map_type not in AVAILABLE_MAP_TYPES:
-            error_msg = f"Invalid map_type '{map_type}'. Choose from: {AVAILABLE_MAP_TYPES}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        map_type = self._check_choice("map_type", map_type, ChangeIndexMapType)
 
         # Collections validation
         if collections is None:
@@ -503,13 +507,14 @@ class ChangeIndexExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="change_index",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of Change Index extraction using threads + progress bar.
 
@@ -533,11 +538,15 @@ class ChangeIndexExtractor(BaseExtractor):
             generate_report (bool, optional): Generate HTML report. Default: False.
             report_options (dict, optional): Report configuration options.
             use_cache (bool, optional): Enable/disable caching for this call.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict: results_df, global_errors, total_entities, total_calculations,
                   successful_calculations, failed_calculations, failed_ids
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache is not None and use_cache:
             return self._bulk_with_cache(
                 bulk_method=self._process_change_index_bulk_extraction_parallel_inner,
@@ -587,7 +596,7 @@ class ChangeIndexExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="change_index",
         generate_report=False,
@@ -607,11 +616,7 @@ class ChangeIndexExtractor(BaseExtractor):
         if merge_existing is None:
             merge_existing = self.merge_existing
 
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -644,9 +649,11 @@ class ChangeIndexExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_change_index)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_change_index, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

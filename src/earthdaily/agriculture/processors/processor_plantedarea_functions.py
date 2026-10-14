@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
+from typing import Literal
 
 import pandas as pd
 
@@ -20,10 +21,12 @@ from earthdaily.agriculture.core.api_utils import (
     retry_with_backoff_no_retry_on_400,
 )
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
 
-available_modes = {"PLANTED_AREA", "CONTROL"}
+PlantedProcessorMode = Literal["PLANTED_AREA", "CONTROL"]
 
 
 def require_planted_params(func):
@@ -49,9 +52,11 @@ class PlantedExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Planted_Area/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_coverage.ipynb
+    OpenAPI: https://planted-area.aws.geosys.com/openapi.json
+    Operation: POST /launch
 
     Args (setup_planted_parameters):
-        processor_mode (str): Processing mode - 'PLANTED_AREA' (planted area and percentage)
+        processor_mode (PlantedProcessorMode): Processing mode - 'PLANTED_AREA' (planted area and percentage)
             or 'CONTROL' (compares the field against control_threshold). Default: 'PLANTED_AREA'
         emergence_date (str): Default emergence date in YYYY-MM-DD. Default: None
             (entities may override via the ``emergence_date`` row column)
@@ -94,7 +99,7 @@ class PlantedExtractor(BaseExtractor):
 
     def setup_planted_parameters(
         self,
-        processor_mode="PLANTED_AREA",
+        processor_mode: PlantedProcessorMode = "PLANTED_AREA",
         emergence_date=None,
         threshold=120,
         control_threshold=4,
@@ -110,7 +115,7 @@ class PlantedExtractor(BaseExtractor):
         Configure parameters for planted area extraction
 
         Args:
-            processor_mode (str): Selection between 'PLANTED_AREA' or 'CONTROL'
+            processor_mode (PlantedProcessorMode): Planted area and percentage, or the control check
             emergence_date (str, optional): Default emergence date in YYYY-MM-DD.
                 May be overridden per entity via the ``emergence_date`` row column
                 (column_mapping-aware, so upstream Emergence output can be wired in).
@@ -124,10 +129,7 @@ class PlantedExtractor(BaseExtractor):
         log.info("Configuring planted area parameters...")
 
         # Processor mode validation
-        if processor_mode not in available_modes:
-            error_msg = f"Invalid processor_mode '{processor_mode}'. Choose from: {available_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        processor_mode = self._check_choice("processor_mode", processor_mode, PlantedProcessorMode)
 
         # Emergence date is optional at setup-time — can be supplied per entity.
         # If provided here, validate format eagerly.
@@ -500,13 +502,14 @@ class PlantedExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="planted",
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of planted area requests using threads + progress bar,
         with optional fail-safe retry and partial save capabilities.
@@ -528,6 +531,9 @@ class PlantedExtractor(BaseExtractor):
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "planted".
             use_cache (bool, optional): Enable/disable caching for this call.
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
             dict:
@@ -541,6 +547,7 @@ class PlantedExtractor(BaseExtractor):
                     "failed_ids": list[str]
                 }
         """
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         if use_cache is not None and use_cache:
             return self._bulk_with_cache(
                 bulk_method=self._process_planted_bulk_extraction_parallel_inner,
@@ -590,7 +597,7 @@ class PlantedExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="planted",
         generate_report=False,
@@ -615,11 +622,7 @@ class PlantedExtractor(BaseExtractor):
             merge_existing = self.merge_existing
 
         # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -652,9 +655,11 @@ class PlantedExtractor(BaseExtractor):
             print(f"   ({skip_count} entities skipped by filter)")
         start_time = time.time()
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(self.process_single_entity_planted)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(self.process_single_entity_planted, row, params): self.get_entity_value(row, "id")
+                executor.submit(paced, row, params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 

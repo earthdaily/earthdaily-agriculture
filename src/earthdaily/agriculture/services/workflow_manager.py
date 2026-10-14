@@ -23,6 +23,7 @@ import yaml
 from loguru import logger
 
 from earthdaily.agriculture.core._fs import OUTPUT_PREFIX_ENV, STORAGE_MODES, apply_output_prefix, is_remote_path
+from earthdaily.agriculture.core.api_utils import warn_specific_dates_deprecated
 from earthdaily.agriculture.core.functions_enhanced import setup_environment
 from earthdaily.agriculture.core.geometry import load_geodataframe
 
@@ -31,6 +32,7 @@ from earthdaily.agriculture.core.identity import EDAuthenticator
 from earthdaily.agriculture.core.logging_setup import setup_logging
 from earthdaily.agriculture.core.naming import _slugify
 from earthdaily.agriculture.services.entity_management import EntityManager
+from earthdaily.agriculture.services.workflow_schema import unknown_keys
 
 # Sentinel for "field absent on the step dict" — used by run_workflow() when
 # applying and restoring runtime `disabled_steps` overrides. Distinguishes
@@ -175,7 +177,7 @@ class WorkflowManager:
                 object-store equivalent.
             eds_env: Override the environment for the **EarthDaily Data
                 Studio** provider, which LRTS uses. Defaults to ``env``, and
-                that default is the intended behaviour:
+                that default is the intended behavior:
 
                     ``prod``    -> EDS prod     (api.earthdaily.com)
                     ``preprod`` -> EDS BLEEDING (bleeding-api.test-internal…)
@@ -192,7 +194,7 @@ class WorkflowManager:
             storage: High-level storage mode. Notebook-friendly toggle that
                 sits between the env var and the explicit kwargs. Values:
 
-                - ``"auto"`` (default): honour ``EDAGRO_OUTPUT_PREFIX`` if set,
+                - ``"auto"`` (default): honor ``EDAGRO_OUTPUT_PREFIX`` if set,
                   otherwise local defaults. Matches the orchestrator-driven
                   Pattern B flow from doc 14.
                 - ``"local"``: ignore ``EDAGRO_OUTPUT_PREFIX``; force local
@@ -217,7 +219,7 @@ class WorkflowManager:
 
         # Writer-path precedence (highest first):
         #   1. Explicit constructor kwargs (output_result_dir / partial_result_dir / cache_dir)
-        #   2. `storage` flag — notebook-friendly override for the env-var behaviour
+        #   2. `storage` flag — notebook-friendly override for the env-var behavior
         #   3. EDAGRO_OUTPUT_PREFIX env var (when storage=="auto") — the canonical
         #      Pattern B invocation from docs/site/agriculture/14. Orchestrators pass
         #      EDAGRO_OUTPUT_PREFIX=s3://my-bucket/runs/2026-01-01 and we
@@ -275,13 +277,10 @@ class WorkflowManager:
         self.bearer_token = self.authenticator.bearer_token
         self.token_expiration = self.authenticator.expiration_date
 
-        # Auto-initialize S3 client (skip gracefully if no credentials)
-        try:
-            logger.info("☁️  Initializing S3 client...")
-            self.authenticator.initialize_s3_client()
-        except Exception as e:
-            logger.warning(f"⚠️  S3 client initialization skipped: {e}")
-            logger.warning("   S3-dependent features will not be available.")
+        # No S3 setup here. The client is built the first time S3 is actually used
+        # (`self.authenticator.s3_client`, or any EDA_S3_cloudstore call), so runs that
+        # never touch S3 pay nothing, and a bad credential fails at that call with a
+        # readable NoCredentialsError instead of a warning swallowed at startup (#108).
 
         # Workflow state
         self.sfd_list = None
@@ -510,6 +509,9 @@ class WorkflowManager:
             raise ValueError("Invalid workflow YAML: must contain 'workflow' or 'analytics' key")
 
         self.workflow_steps = self.workflow_cfg.get("steps", [])
+        # Keys nothing reads (a typo like `export_fromat:` used to be silently ignored).
+        # A warning for now; an error in 3.0.
+        self.workflow_unknown_keys = self._warn_unknown_workflow_keys(self.workflow_cfg)
 
         # Build lookup: step_name -> step_config
         self.step_map = {}
@@ -1418,7 +1420,7 @@ class WorkflowManager:
 
         Note: cascade-skip of downstream steps is enforced at runtime by the
         existing empty-upstream branch — this widget does not pre-shade
-        descendants. Disabled-node colour is the only visual cue.
+        descendants. Disabled-node color is the only visual cue.
 
         Args:
             **kwargs: Forwarded to ``visualize_workflow()`` (height, h_spacing, …).
@@ -1553,6 +1555,31 @@ class WorkflowManager:
         }
 
     # ── Private helpers ──────────────────────────────────────────────────────
+
+    def _warn_unknown_workflow_keys(self, workflow_cfg: dict[str, Any]) -> list[str]:
+        """Warn about workflow.yml keys that nothing reads, with a suggestion; return their paths.
+
+        The schema is ``services/workflow_schema.py``. An extra ``settings`` key is fine when a
+        step's setup method accepts it (settings are passed through to setup methods), so each
+        extractor step's setup signature is looked up; an import failure is left to surface
+        where the step runs.
+        """
+        setup_params: dict[str, set[str]] = {}
+        for step in workflow_cfg.get("steps") or []:
+            if not isinstance(step, dict) or not step.get("extractor") or not step.get("module"):
+                continue
+            method = (step.get("setup") or {}).get("method")
+            if not method:
+                continue
+            try:
+                fn = getattr(getattr(importlib.import_module(step["module"]), step["extractor"]), method)
+                setup_params[step.get("name", "?")] = set(inspect.signature(fn).parameters) - {"self"}
+            except Exception:  # noqa: BLE001 — reported when the step runs
+                continue
+        problems = unknown_keys(workflow_cfg, setup_params)
+        if problems:
+            logger.warning(f"workflow.yml: {len(problems)} key(s) that nothing reads (typo?): " + "; ".join(problems))
+        return problems
 
     def _resolve_date_sentinels(self, workflow_cfg: dict[str, Any]) -> None:
         """Rewrite date sentinels (`today`, `yesterday`, `today-Nd`, `today-Nw`,
@@ -1962,7 +1989,7 @@ class WorkflowManager:
         passthrough, unknown = {}, []
         for key, value in run_params.items():
             if key in explicitly_passed:
-                continue  # explicit kwargs win — existing behaviour is unchanged
+                continue  # explicit kwargs win — existing behavior is unchanged
             if run_accepts_kwargs or key in run_accepted:
                 passthrough[key] = value
             else:
@@ -2044,6 +2071,9 @@ class WorkflowManager:
         """
         Load target dates from a CSV file for specific dates extraction mode.
 
+        .. deprecated::
+            Specific-dates extraction is removed in 3.0.
+
         The CSV should have a column 'target_date' with dates in YYYY-MM-DD format.
 
         Args:
@@ -2058,6 +2088,7 @@ class WorkflowManager:
             2024-12-15
             2024-12-21
         """
+        warn_specific_dates_deprecated("WorkflowManager.load_target_dates", logger)
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"❌ Target dates file not found: {file_path}")
 
@@ -2170,6 +2201,7 @@ class WorkflowManager:
                     logger.warning(f"Skipping invalid date: {date_str}")
 
         if all_dates:
+            warn_specific_dates_deprecated("a 'target_dates' column in the entity file", logger)
             self.target_dates = sorted(list(all_dates))
             print(f"📅 Detected {len(self.target_dates)} target dates from file:")
             for d in self.target_dates[:5]:

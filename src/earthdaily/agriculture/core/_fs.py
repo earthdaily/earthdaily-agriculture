@@ -6,7 +6,7 @@ For local paths the helpers fall back to plain ``os`` operations; for remote
 paths they delegate to ``fsspec`` (which pandas / pyarrow already use under
 the hood for ``to_csv`` / ``to_parquet`` URIs).
 
-Backends recognised today: ``s3://``, ``gs://``, ``gcs://``, ``az://``,
+Backends recognized today: ``s3://``, ``gs://``, ``gcs://``, ``az://``,
 ``azure://``, ``abfs://``, ``http://``, ``https://``, ``file://``. Anything
 without a ``<scheme>://`` prefix is treated as a local path.
 """
@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-# Schemes we actively want to recognise as "remote" — i.e. the writer should
+# Schemes we actively want to recognize as "remote" — i.e. the writer should
 # skip os.makedirs and let fsspec handle path semantics. ``file://`` is local
 # but kept out of this set because we don't want to skip mkdir for it.
 _REMOTE_SCHEMES = (
@@ -128,7 +128,7 @@ def _azure_storage_options() -> dict[str, Any]:
     sas = os.environ.get("AZURE_STORAGE_SAS_TOKEN")
     key = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
     if sas:
-        # adlfs accepts the token with or without the leading '?'; normalise it off.
+        # adlfs accepts the token with or without the leading '?'; normalize it off.
         opts["sas_token"] = sas.lstrip("?")
     elif key:
         opts["account_key"] = key

@@ -29,13 +29,60 @@ except ImportError:
 
 # Internal Project Utilities
 from earthdaily.agriculture.config.urls import agro_urls
+from earthdaily.agriculture.core.api_utils import retry_with_backoff_no_retry_on_400
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, requires_token
 from earthdaily.agriculture.core.identity import EDAuthenticator
 from earthdaily.agriculture.services.user_management import UserManager
 
 
+def _crop_filter_value(crop_id):
+    """MDM filter value for one crop id or a list of them (``$in:A|B`` for several)."""
+    crops = [crop_id] if isinstance(crop_id, str) else list(crop_id)
+    crops = [str(c).upper() for c in crops]
+    return crops[0] if len(crops) == 1 else "$in:" + "|".join(crops)
+
+
+# MDM /seasonfields with $limit=none intermittently returns 500 on large
+# accounts (GEOSD-5964, ~15k season fields for LAI_RADAR_SOYL_API), even with
+# sowingDate / crop filters. Paging with $limit + $offset on a stable $sort=id
+# returns the same rows (checked 2026-10-08: 15,539 ids, no duplicate, no 500
+# over 3 runs at 5000 per page). Each request, paged or batched, also gets a
+# few retries on 5xx / network errors.
+SEASONFIELD_PAGE_SIZE = 5000
+SEASONFIELD_MAX_ATTEMPTS = 3
+SEASONFIELD_RETRY_BASE_DELAY_S = 10.0
+
+
+def _get_json(url, headers):
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+
+def _search_json(url, payload, headers):
+    response = requests.request("SEARCH", url, json=payload, headers=headers)  # type: ignore[arg-type]
+    response.raise_for_status()
+    return response.json()
+
+
+def _with_5xx_retry(func, *args):
+    """``func(*args)`` retried on 5xx / network errors, never on 4xx: a 4xx
+    raises ValueError at once, a 5xx still failing after
+    SEASONFIELD_MAX_ATTEMPTS raises RuntimeError."""
+    return retry_with_backoff_no_retry_on_400(
+        func, SEASONFIELD_MAX_ATTEMPTS, SEASONFIELD_RETRY_BASE_DELAY_S, 60.0, *args
+    )
+
+
 def get_seasonfield_list(
-    env, bearer_token, start_date=None, end_date=None, crop_id=None, sowing_date_gte=None, sowing_date_lte=None
+    env,
+    bearer_token,
+    start_date=None,
+    end_date=None,
+    crop_id=None,
+    sowing_date_gte=None,
+    sowing_date_lte=None,
+    page_size=SEASONFIELD_PAGE_SIZE,
 ):
     """
     Retrieve seasonfield list with optional filters.
@@ -45,9 +92,12 @@ def get_seasonfield_list(
         bearer_token (str): Authentication token
         start_date (str, optional): Legacy parameter - alias for sowing_date_gte
         end_date (str, optional): Legacy parameter - alias for sowing_date_lte
-        crop_id (str, optional): Filter by crop ID (e.g., 'CORN', 'SOYBEANS', 'WHEAT')
+        crop_id (str | list, optional): Filter by crop ID (e.g., 'CORN') or a list of them
         sowing_date_gte (str, optional): Filter sowingDate >= this date (YYYY-MM-DD)
         sowing_date_lte (str, optional): Filter sowingDate <= this date (YYYY-MM-DD)
+        page_size (int, optional): Season fields per request; pages are read
+            until a short page (default SEASONFIELD_PAGE_SIZE). Replaces the
+            former single ``$limit=none`` request (GEOSD-5964).
 
     Returns:
         pd.DataFrame: DataFrame with seasonfield data
@@ -66,7 +116,7 @@ def get_seasonfield_list(
     headers = {"Content-Type": "application/json", "Authorization": "Bearer " + bearer_token}
 
     # Base parameters (same as original)
-    params = "/seasonfields?$limit=none&$fields=id,name,geometry,crop,field.farm.grower.companyName,field.farm.grower.firstname,sowingDate"
+    params = "/seasonfields?$fields=id,name,geometry,crop,field.farm.grower.companyName,field.farm.grower.firstname,sowingDate"
 
     # Handle legacy parameters (start_date/end_date as aliases for backward compatibility)
     if start_date and not sowing_date_gte:
@@ -87,13 +137,23 @@ def get_seasonfield_list(
 
     # Add crop filter (NEW)
     if crop_id:
-        params += f"&crop.id={crop_id.upper()}"
+        params += f"&crop.id={_crop_filter_value(crop_id)}"
 
-    # Make request (same as original)
-    response = requests.get(url + params, headers=headers)
-    response.raise_for_status()
-    result = pd.json_normalize(response.json())
-    return result
+    # Page through the results on a stable sort until a short page
+    rows: list = []
+    offset = 0
+    previous_first_id = None
+    while True:
+        page = _with_5xx_retry(_get_json, f"{url}{params}&$sort=id&$limit={page_size}&$offset={offset}", headers)
+        if page and offset and page[0].get("id") == previous_first_id:
+            # The API ignored $offset: same page again, stop instead of looping forever
+            raise RuntimeError(f"seasonfields pagination not honoured at $offset={offset}")
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        previous_first_id = page[0].get("id")
+        offset += page_size
+    return pd.json_normalize(rows)
 
 
 def get_season_fields(
@@ -143,7 +203,7 @@ def get_season_fields(
 
             # Ajouter le filtre sur crop.Id si fourni
             if crop_id:
-                filters.append({"crop.Id": crop_id})
+                filters.append({"crop.Id": _crop_filter_value(crop_id)})
 
             payload = {
                 "query": {
@@ -155,9 +215,7 @@ def get_season_fields(
 
             headers = {"Content-Type": "application/json", "Authorization": "Bearer " + token}
 
-            response = requests.request("SEARCH", endpoint, json=payload, headers=headers)  # type: ignore[arg-type]
-            response.raise_for_status()
-            data = response.json()
+            data = _with_5xx_retry(_search_json, endpoint, payload, headers)
 
             print(f"✅ Batch {i // batch_size + 1}: retrieved {len(data)} items")
 
@@ -216,6 +274,7 @@ class EntityManager(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_entity_management.ipynb
+    OpenAPI: https://api.geosys-na.net/master-data-management/v6/swagger/v7.1/swagger.json
 
     Supported operations:
         - Farm: create, get, update, delete
@@ -225,6 +284,10 @@ class EntityManager(BaseExtractor):
 
     Entity fields:
         id, geometry, crop, sowing_date, name, farm_name (varies by operation)
+
+    Constraints:
+        - load_input_file() requires the columns Grower, Farm, Seasonfield, Sowing, Crop and
+          Geometry.
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None, user_manager: UserManager = None):
@@ -894,7 +957,7 @@ class EntityManager(BaseExtractor):
         if field_id:
             params["field.id"] = field_id
         if crop_code:
-            params["crop.code"] = crop_code.upper()
+            params["crop.code"] = _crop_filter_value(crop_code)
         if external_ids:
             # Each entry filters on one externalIds system. A single value is sent as a
             # bare value; multiple values use the MDM ``$in:`` operator joined on ``|``
@@ -960,7 +1023,7 @@ class EntityManager(BaseExtractor):
 
         # Dedup on seasonfield id so a field can never be returned twice (defensive —
         # a multi-farm $in: filter should not produce duplicates, but a custom $fields
-        # set or future API behaviour might).
+        # set or future API behavior might).
         if not df.empty and "id" in df.columns:
             before = len(df)
             df = df.drop_duplicates(subset="id").reset_index(drop=True)
@@ -1034,7 +1097,7 @@ class EntityManager(BaseExtractor):
         if sowing_date_lte:
             filters_applied.append(f"sowingDate <= {sowing_date_lte}")
         if crop_id:
-            filters_applied.append(f"crop = {crop_id.upper()}")
+            filters_applied.append(f"crop = {_crop_filter_value(crop_id)}")
         if farm_name:
             if isinstance(farm_name, (list, tuple, set)):
                 filters_applied.append(f"farm in [{', '.join(str(n) for n in farm_name)}]")
@@ -1058,7 +1121,7 @@ class EntityManager(BaseExtractor):
         Args:
             start_date (str, optional): Start date for sowingDate filter (format: YYYY-MM-DD)
             end_date (str, optional): End date for sowingDate filter (format: YYYY-MM-DD)
-            crop_id (str, optional): Crop ID to filter by
+            crop_id (str | list, optional): Crop ID, or a list of crop IDs, to filter by
             ids (List[str], optional): List of specific seasonfield IDs to load.
                                      If None, loads all available seasonfields.
             batch_size (int): Number of seasonfields to process per batch (default: 5000)
@@ -1238,7 +1301,7 @@ class EntityManager(BaseExtractor):
                        being provisioned, and a stale id in a spreadsheet would
                        silently file them under someone else.
         Farm           always ``farm_name`` — the farm this run creates.
-        Geometry       **required**. Normalised by
+        Geometry       **required**. Normalized by
                        :func:`~earthdaily.agriculture.core.geometry.normalize_field_geometry`
                        — reprojected to EPSG:4326, checked areal and valid,
                        size-floored.

@@ -120,7 +120,7 @@ class TestSetupEmergenceParameters:
         assert emergence_extractor.emergence_params["emergence_type"] == etype
 
     def test_invalid_emergence_type_raises(self, emergence_extractor):
-        with pytest.raises(ValueError, match="Invalid emergence type"):
+        with pytest.raises(ValueError, match="Invalid emergence_type"):
             emergence_extractor.setup_emergence_parameters(emergence_type="BOGUS")
 
     # --- month validation ---

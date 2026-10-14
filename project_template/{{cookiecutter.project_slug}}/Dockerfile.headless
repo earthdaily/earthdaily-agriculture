@@ -1,0 +1,70 @@
+# {{ cookiecutter.project_name }} — headless image for large stateless runs
+#
+# Built leaner than `Dockerfile` for containers that run one shard and exit; runs the
+# large-run scripts (app.dispatch_shards / app.run_extractor / app.merge_shards).
+# See docs/14 - Deployment_patterns.md.
+#
+#   docker build -f Dockerfile.headless -t <registry>/{{ cookiecutter.project_slug }}-headless:<tag> .
+#   docker build -f Dockerfile.headless --build-arg CLOUD_EXTRA=azure ...   # az:// instead of s3://
+#
+# Differences from `Dockerfile`:
+#   - installs earthdaily-agriculture with ONE cloud backend, not the project's
+#     requirements.txt (no Jupyter, plotting or notebook tooling in a batch container);
+#   - builds into a virtualenv and copies only that into the final stage, so no pip
+#     cache or build leftovers ship, and drops the libraries' bundled test suites;
+#   - EDAGRO_STORAGE=s3: the run refuses to start unless results / partials resolve to a
+#     remote URI. A stateless container's disk is gone when it exits.
+
+ARG PYTHON_VERSION={{ cookiecutter.python_version }}
+
+# ---- build: resolve and install into /opt/venv ------------------------------------
+FROM python:${PYTHON_VERSION}-slim AS build
+
+# fsspec backend for EDAGRO_OUTPUT_PREFIX: s3 (s3://) or azure (az://).
+ARG CLOUD_EXTRA=s3
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /build
+COPY dist/ ./dist/
+{% if cookiecutter.edagro_install_mode == 'wheel' %}
+# Local wheel (scaffolded with --use-local-wheel): the newest one in dist/.
+RUN pip install --no-cache-dir "$(ls dist/earthdaily_agriculture-*.whl | sort -V | tail -1)[${CLOUD_EXTRA}]"
+{% else %}
+# The plain pin plus the same pin with the cloud extra: pip merges them into one install.
+RUN pip install --no-cache-dir "earthdaily-agriculture=={{ cookiecutter.edagro_wheel_version }}" \n        "earthdaily-agriculture[${CLOUD_EXTRA}]=={{ cookiecutter.edagro_wheel_version }}"
+{% endif %}
+
+# Bundled test suites (pandas/tests, numpy/**/tests, scipy/**/tests, ...) are tens of MB
+# and never imported at runtime. __pycache__ stays: the non-root runtime user cannot
+# rewrite it, so removing it would recompile every module on every container start.
+RUN find /opt/venv/lib -depth -type d -name tests -path "*/site-packages/*" -exec rm -rf {} + \
+    && python -c "import earthdaily.agriculture, geopandas, pandas, pyarrow; print('imports OK')"
+
+# ---- runtime ----------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim
+
+# The geo wheels bundle GDAL / GEOS / PROJ but need libexpat at import.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    EDAGRO_LOG_CONSOLE_ONLY=1 \
+    EDAGRO_STORAGE=s3
+
+WORKDIR /app
+COPY app/ ./app/
+COPY configuration/ ./configuration/
+
+RUN useradd --create-home --shell /bin/bash edagro && chown -R edagro /app
+USER edagro
+
+# One image for the three steps of a large run; the module is the first argument:
+#   docker run <image> app.dispatch_shards --entities ... --base ... --rate 89
+#   docker run <image> app.run_extractor --extractor ... --manifest <base> --shard <i>
+#   docker run <image> app.merge_shards --base <base> --prefix ...
+ENTRYPOINT ["python", "-m"]
+CMD ["app.run_extractor", "--help"]

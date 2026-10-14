@@ -7,13 +7,14 @@ and forward the final artifact without parsing arbitrary log lines.
 
 See ``docs/14 - Deployment_patterns.md`` for the contract this entrypoint
 honours and the two supported deployment modes (Pattern A = GitHub Actions
-cron; Pattern B = Docker container on ECS / Cloud Run / Argo).
+cron; Pattern B = Docker container on any scheduler, or under `docker run`).
 
 Usage::
 
     python -m app.run_pipeline --prefix run_20260512
     python -m app.run_pipeline --prefix smoke --limit 5
     python -m app.run_pipeline --prefix shard_0 --shard 0 --num-shards 4
+    python -m app.run_pipeline --prefix run_20260512 --retry-failed
 """
 
 from __future__ import annotations
@@ -21,10 +22,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
 
 from loguru import logger
 
+from earthdaily.agriculture.core.sharding import find_report, select_shard
 from earthdaily.agriculture.services.workflow_manager import WorkflowManager
 
 
@@ -59,17 +60,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default="configuration/workflow.yml",
         help="Path to the workflow YAML (default: configuration/workflow.yml).",
     )
+    p.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Process only the entities a previous run recorded as failed (retry_failed_only).",
+    )
     return p.parse_args(argv)
-
-
-def _select_shard(entity_list, shard: int, num_shards: int):
-    """Pick rows where index % num_shards == shard. Pure pandas, stable order."""
-    if num_shards is None or num_shards <= 1:
-        return entity_list
-    if shard is None or not (0 <= shard < num_shards):
-        raise ValueError(f"--shard must be in [0, {num_shards}) when --num-shards={num_shards}")
-    mask = entity_list.index % num_shards == shard
-    return entity_list[mask].reset_index(drop=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,9 +79,16 @@ def main(argv: list[str] | None = None) -> int:
         log_level="INFO",
         log_to_console=True,
         log_to_console_only=os.environ.get("EDAGRO_LOG_CONSOLE_ONLY") == "1",
+        # EDAGRO_STORAGE=s3 (set by Dockerfile.headless): refuse to start unless outputs
+        # resolve to a remote URI — a stateless container's disk is gone when it exits.
+        storage=os.environ.get("EDAGRO_STORAGE", "auto"),
     )
 
     manager.load_workflow(args.workflow)
+    if args.retry_failed:
+        # Same switch as `settings.retry_failed_only` in the YAML: every step resumes
+        # from its newest failed_ids file instead of processing the full list.
+        manager.workflow_cfg.setdefault("settings", {})["retry_failed_only"] = True
     manager.load_seasonfields()       # or load_geodataframe(...) from inputs/
 
     entities = manager.sfd_list
@@ -93,8 +96,12 @@ def main(argv: list[str] | None = None) -> int:
         entities = entities.head(args.limit)
         logger.info(f"--limit {args.limit}: processing {len(entities)} entities")
     if args.num_shards:
-        entities = _select_shard(entities, args.shard, args.num_shards)
+        entities = select_shard(entities, args.shard, args.num_shards)
         logger.info(f"--shard {args.shard}/{args.num_shards}: {len(entities)} entities")
+        if entities.empty:
+            # More shards than entities: nothing to do is not a failure.
+            logger.warning("This shard has no entities — nothing to do.")
+            return 0
 
     results = manager.run_workflow(entity_list=entities, run_prefix=args.prefix)
 
@@ -108,15 +115,12 @@ def main(argv: list[str] | None = None) -> int:
         logger.error(f"Pipeline finished with no rows from step '{final_step}' — nothing to publish.")
         return 1
 
-    # Convention: the workflow_runner already exported the file via export_results;
-    # we just resolve where it landed.
-    report_path = Path(manager.output_result_dir).resolve()
-    # Pick the newest *_final.csv in the output dir as the canonical report.
-    candidates = sorted(report_path.glob(f"*{args.prefix}*_final.csv")) or sorted(report_path.glob("*_final.csv"))
-    if not candidates:
-        logger.error(f"No *_final.csv found under {report_path} — workflow did not produce a report.")
+    # The workflow already exported the file; resolve where it landed — a local folder,
+    # or s3:// / az:// under EDAGRO_OUTPUT_PREFIX — and in either export format.
+    report = find_report(str(manager.output_result_dir), args.prefix)
+    if report is None:
+        logger.error(f"No *_final result under {manager.output_result_dir} — workflow did not produce a report.")
         return 1
-    report = candidates[-1]
 
     # The stdout contract — the workflow scrapes this line. Keep it last,
     # keep it on its own line, keep the format stable.

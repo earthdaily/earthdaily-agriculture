@@ -55,7 +55,7 @@ def test_empty_step_dict_renders_without_error(populated: WorkflowRunReporter) -
 
     html = populated.render_html()
     assert "Run Report" in html
-    # No step table when there are no steps to summarise.
+    # No step table when there are no steps to summarize.
     assert "<h3>Steps" not in html
     # No errors section either.
     assert "<h3>Errors" not in html

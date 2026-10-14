@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import wraps
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -22,8 +23,20 @@ from earthdaily.agriculture.core.api_utils import (
 )
 from earthdaily.agriculture.core.api_utils import validate_historical_years as validate_historical_seasons
 from earthdaily.agriculture.core.base_extractor import BaseExtractor, cache_single_entity, requires_token
+from earthdaily.agriculture.core.choices import MergeMode, check_choice, register_case_insensitive
 from earthdaily.agriculture.core.geometry import validate_wkt
 from earthdaily.agriculture.core.identity import EDAuthenticator
+from earthdaily.agriculture.core.results import BulkResult
+
+# Allowed values, read by the validator below and by generate_ai_context: one list each.
+# Kept separate from FLM's list, which also accepts NDRE and COLORCOMPOSITION: whether the
+# coverage API takes those too is unverified.
+CoverageIndex = Literal["NDVI", "EVI", "CVI", "CVIN", "GNDVI", "LAI", "NDWI", "NDMI", "S2REP"]
+CoverageFilter = Literal["none", "duplicate", "crop_coverage"]
+# CoverageMaskType. 'All' returns one row per (image, mask) so masks can be compared side by
+# side via the 'mask' output column.
+CoverageMask = Literal["Auto", "Native", "ACM", "ML", "MLCirrus", "All"]
+register_case_insensitive(CoverageMask)
 
 
 def require_coverage_params(func):
@@ -41,7 +54,7 @@ def require_coverage_params(func):
 # image.sensor values accepted by catalog-imagery (MapProduct v5 TimeSeriesSensors enum,
 # upper-cased like the 'sensor' field of the response). An unknown value is not rejected by
 # the API — it silently returns no images — so names are checked here instead.
-VALID_SENSORS = {
+CoverageSensor = Literal[
     "LANDSAT_5", "LANDSAT_7", "LANDSAT_8", "LANDSAT_9", "SENTINEL_2",
     "DEIMOS", "DEIMOS_1", "DEIMOS_1_S", "DEIMOS_1_P", "DMC", "DMC2",
     "RAPIDEYE_3A", "RAPIDEYE_1B", "RESOURCESAT2", "CBERS4", "M4C", "MICASENSE",
@@ -50,7 +63,8 @@ VALID_SENSORS = {
     "GAOFEN_6_WFV1", "GAOFEN_6_WFV2", "GAOFEN_6_WFV3",
     "HJ2A_CCD1", "HJ2A_CCD2", "HJ2A_CCD3", "HJ2A_CCD4",
     "HJ2B_CCD1", "HJ2B_CCD2", "HJ2B_CCD3", "HJ2B_CCD4",
-}  # fmt: skip
+]  # fmt: skip
+register_case_insensitive(CoverageSensor)
 
 
 class CoverageExtractor(BaseExtractor):
@@ -63,31 +77,32 @@ class CoverageExtractor(BaseExtractor):
 
     Documentation: https://docs.earthdaily.com/agro/library/Api_reference/?utm_source=github&utm_medium=repo&utm_campaign=earthdaily-agriculture&utm_content=docstring
     Notebook: https://github.com/earthdaily/Examples-and-showcases/blob/main/agriculture/EDAgriculture_coverage.ipynb
+    OpenAPI: https://api.geosys-na.net/field-level-maps/v5/swagger/v1/swagger.json
+    Operation: POST /season-fields/catalog-imagery
 
     Args (setup_coverage_parameters):
-        vegetation_index (str): Vegetation index type ('NDVI', 'EVI', etc.). Default: 'NDVI'
+        vegetation_index (CoverageIndex): Vegetation index the coverage is computed for. Default: 'NDVI'
         start_date (str): Start date in YYYY-MM-DD format. Default: '2025-01-01'
         end_date (str): End date in YYYY-MM-DD format. Default: None — **no upper bound**,
             i.e. every image from start_date onward is returned (the query becomes
             image.date=$gte:start_date). It is *not* defaulted to today; set it explicitly
-            to bound the catalogue query.
+            to bound the catalog query.
         clear_cover_min (int): Minimum clear sky coverage percentage (0-100). Default: 90
         clear_cover_max (int): Maximum clear sky coverage percentage (0-100). Default: 100
         use_specific_date (bool): Restrict to exact date. Default: False
-        filter (str): Filtering mode - 'none', 'duplicate' or 'crop_coverage'. Default: 'none'
+        filter (CoverageFilter): Filtering mode. Default: 'none'
             'duplicate' collapses near-simultaneous multi-sensor captures (see delay).
             'crop_coverage' expands the query per entity across prior seasons and
             **requires historical_seasons**; the per-entity window is computed from the
             entity's start_date/end_date month-day applied to each historical year.
         delay (int): Max days between multi-sensor captures for duplicate filter. Default: 3
-        mask (str): Cloud mask type — 'Auto', 'Native', 'ACM', 'ML', 'MLCirrus' or 'All'
-            (case-insensitive). 'All' returns one row per image *per mask*, so the same image
-            appears several times and the 'mask' output column tells them apart — use it to
-            compare masks. Not compatible with filter='duplicate'. Default: 'auto'
+        mask (CoverageMask): Cloud mask type. 'All' returns one row per image *per mask*, so the
+            same image appears several times and the 'mask' output column tells them apart — use
+            it to compare masks. Default: 'Auto'
         recalibration (bool): Apply cross-sensor recalibration to coverage metrics. Default: False
         historical_seasons (list[int]): Prior season years used when filter='crop_coverage'
             (required for that filter, e.g. [2024, 2023, 2022]). Default: None
-        sensors (str | list[str]): Keep only images from these sensors (e.g. 'SENTINEL_2' or
+        sensors (CoverageSensor | list[CoverageSensor]): Keep only images from these sensors (e.g. 'SENTINEL_2' or
             ['SENTINEL_2', 'LANDSAT_9']), case-insensitive. Sent to the API as image.sensor=$in:... and
             applied before the duplicate filter. Default: None (all sensors)
         use_cache (bool): Reuse cached API responses and cache new results to avoid
@@ -98,6 +113,11 @@ class CoverageExtractor(BaseExtractor):
 
     Output columns:
         image_id, coverage_percent, date, mask, sensor, spatial_resolution
+
+    Constraints:
+        - filter='crop_coverage' requires historical_seasons.
+        - mask='All' cannot be combined with filter='duplicate'.
+        - filter='duplicate' with sensors set needs at least two sensors.
     """
 
     def __init__(self, bearer_token, token_expiration, config, workflow_ref=None):
@@ -118,19 +138,19 @@ class CoverageExtractor(BaseExtractor):
 
     def setup_coverage_parameters(
         self,
-        vegetation_index="NDVI",
+        vegetation_index: CoverageIndex = "NDVI",
         start_date="2025-01-01",
         end_date=None,
         clear_cover_min=90,
         clear_cover_max=100,
         use_specific_date=False,
-        filter="none",
+        filter: CoverageFilter = "none",
         delay=3,
-        mask="auto",
+        mask: CoverageMask = "Auto",
         partial_frequency=50,
         recalibration=False,
         historical_seasons=None,
-        sensors=None,
+        sensors: CoverageSensor | list[CoverageSensor] | None = None,
         column_mapping=None,
         output_mapping=None,
         exclude_columns=None,
@@ -146,9 +166,7 @@ class CoverageExtractor(BaseExtractor):
 
         sensors restricts the output to the given sensor(s) (e.g. 'SENTINEL_2').
         """
-        valid_indexes = {"NDVI", "EVI", "CVI", "CVIN", "GNDVI", "LAI", "NDWI", "NDMI", "S2REP"}
-        if vegetation_index not in valid_indexes:
-            raise ValueError(f"Invalid vegetation_index '{vegetation_index}'. Must be one of {valid_indexes}")
+        vegetation_index = check_choice("vegetation_index", vegetation_index, CoverageIndex)
 
         try:
             datetime.strptime(start_date, "%Y-%m-%d")
@@ -164,26 +182,13 @@ class CoverageExtractor(BaseExtractor):
         if not (0 <= clear_cover_min <= 100):
             raise ValueError(f"Invalid clear_cover_min '{clear_cover_min}'. Must be between 0 and 100.")
 
-        valid_filters = {"none", "duplicate", "crop_coverage"}
-        if filter not in valid_filters:
-            raise ValueError(f"Invalid filter selected '{filter}'. Must be one of {valid_filters}")
+        filter = check_choice("filter", filter, CoverageFilter)
 
         if delay < 0:
             raise ValueError(f"Invalid delay '{delay}'. Must be non-negative.")
 
-        # CoverageMaskType — 'All' returns one row per (image, mask) so masks can be compared
-        # side by side via the 'mask' output column. Case-insensitive, normalized to API casing.
-        valid_masks = {
-            "native": "Native",
-            "acm": "ACM",
-            "auto": "Auto",
-            "ml": "ML",
-            "mlcirrus": "MLCirrus",
-            "all": "All",
-        }
-        if not isinstance(mask, str) or mask.lower() not in valid_masks:
-            raise ValueError(f"Invalid mask '{mask}'. Must be one of {sorted(valid_masks.values())}")
-        mask = valid_masks[mask.lower()]
+        # Case-insensitive (registered above): 'auto' comes back as the API's 'Auto'.
+        mask = check_choice("mask", mask, CoverageMask)
 
         # 'All' repeats each image once per available mask. The duplicate filter pairs images
         # across different sensors and sums their coverage, so those repeats would inflate the
@@ -212,10 +217,7 @@ class CoverageExtractor(BaseExtractor):
                 raise ValueError(f"Invalid sensors '{sensors}'. Must be a sensor name or a non-empty list of them.")
             if not all(isinstance(s, str) and s.strip() for s in sensors):
                 raise ValueError(f"Invalid sensors '{sensors}'. Every sensor must be a non-empty string.")
-            sensors = sorted({s.strip().upper() for s in sensors})
-            unknown = [s for s in sensors if s not in VALID_SENSORS]
-            if unknown:
-                raise ValueError(f"Unknown sensors {unknown}. Must be among {sorted(VALID_SENSORS)}")
+            sensors = sorted(set(self._check_choices("sensors", [s.strip() for s in sensors], CoverageSensor)))
 
         # The duplicate filter only keeps pairs of images from *different* sensors, so a
         # single-sensor selection would always come back empty.
@@ -814,7 +816,7 @@ class CoverageExtractor(BaseExtractor):
         filter_column=None,
         filter_value=None,
         filter_type="exclude",
-        merge_existing=None,
+        merge_existing: MergeMode | None = None,
         skip_export=False,
         prefix="coverage",
         flm_params=None,
@@ -822,7 +824,8 @@ class CoverageExtractor(BaseExtractor):
         generate_report=False,
         report_options=None,
         use_cache=None,
-    ):
+        rate_limit=None,
+    ) -> BulkResult:
         """
         Bulk processing of entity coverage using threads + progress bar,
         with optional fail-safe retry, filter capabilities, and caching.
@@ -840,18 +843,24 @@ class CoverageExtractor(BaseExtractor):
             filter_column (str, optional): Column name to filter entities by.
             filter_value (any, optional): Value to filter in the filter_column.
             filter_type (str, optional): 'exclude' to skip rows with filter_value, 'include' to process only rows with filter_value. Defaults to 'exclude'.
-            merge_existing (str, optional): Merge strategy - 'auto', 'preserve', or 'mark'. If None, uses instance default.
+            merge_existing (MergeMode, optional): How results already on disk are combined with
+                new ones. If None, uses the instance default.
             skip_export (bool, optional): If True, skip final export (useful when chaining extractions). Default: False.
             prefix (str, optional): Prefix for output filenames and failed IDs files. Default: "coverage".
             flm_params (dict, optional): FLM parameters. If provided, sets recalibration=True and stores on self.
             recalibration (bool, optional): If True, uses recalibration API endpoint. Default: False.
             use_cache (bool, optional): Override instance-level cache setting. Default: None (uses self.use_cache).
+            rate_limit (float, optional): Requests per second for this run, shared by all
+                ``max_workers`` threads. None (default) falls back to ``self.rate_limit``, then
+                ``DEFAULT_RATE_LIMIT``; unset means no limit.
 
         Returns:
-            dict: Contains results DataFrame, errors list, and summary statistics.
-                  When cache is active, also includes cache_hit and cache_miss counts.
+            BulkResult: ``results_df``, ``failed_ids``, ``global_errors`` and the counts
+                (``total_entities``, ``total_calculations``, ``successful_calculations``,
+                ``failed_calculations``); ``cache_hit`` / ``cache_miss`` when caching is on.
         """
         # Route through cache wrapper if caching is enabled
+        self._bulk_rate_limit = rate_limit  # read by _paced()
         cache_enabled = use_cache if use_cache is not None else self.use_cache
         if cache_enabled and self.cache_key_columns is not None:
             return self._bulk_with_cache(
@@ -941,12 +950,7 @@ class CoverageExtractor(BaseExtractor):
         if merge_existing is None:
             merge_existing = self.merge_existing
 
-        # Validate merge_existing value
-        valid_modes = ["auto", "preserve", "mark"]
-        if merge_existing not in valid_modes:
-            error_msg = f"Invalid merge_existing='{merge_existing}'. Choose from: {valid_modes}"
-            log.error(error_msg)
-            raise ValueError(error_msg)
+        merge_existing = self._check_choice("merge_existing", merge_existing, MergeMode)
 
         log.info(f"Merge strategy: {merge_existing}")
 
@@ -979,9 +983,11 @@ class CoverageExtractor(BaseExtractor):
 
         single_entity_method = self.process_single_entity_coverage
 
+        # One limiter per run, shared by every worker (a no-op without a rate limit).
+        paced = self._paced(single_entity_method)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_id = {
-                executor.submit(single_entity_method, row.to_dict(), params): self.get_entity_value(row, "id")
+                executor.submit(paced, row.to_dict(), params): self.get_entity_value(row, "id")
                 for _, row in filtered_entity_list.iterrows()
             }
 
@@ -1111,6 +1117,7 @@ class CoverageExtractor(BaseExtractor):
         self.coverage_params["recalibration"] = True
         return self.process_single_entity_coverage(row, params)
 
-    def process_entity_coverage_bulk_parallel_recalibration(self, *args, **kwargs):
+    def process_entity_coverage_bulk_parallel_recalibration(self, *args, **kwargs) -> BulkResult:
+        """``process_entity_coverage_bulk_parallel`` with ``recalibration=True``; same arguments and result."""
         kwargs["recalibration"] = True
         return self.process_entity_coverage_bulk_parallel(*args, **kwargs)

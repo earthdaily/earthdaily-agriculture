@@ -161,7 +161,7 @@ class TestGetWeatherData:
     @patch("earthdaily.agriculture.extractors.weather_functions.validate_wkt", side_effect=lambda x: x)
     @patch("earthdaily.agriculture.extractors.weather_functions.requests.get")
     def test_pandas_timestamp_dates_normalized(self, mock_get, mock_wkt, mock_centroid, configured_weather_extractor):
-        """pd.Timestamp dates should be normalised to YYYY-MM-DD before API call."""
+        """pd.Timestamp dates should be normalized to YYYY-MM-DD before API call."""
         entity = {
             "id": "z361x33",
             "geometry": WEATHER_WKT,

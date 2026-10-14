@@ -92,14 +92,14 @@ class TestSetupWeatherParameters:
 
     def test_invalid_parameter_in_list_raises(self, weather_extractor):
         with patch.object(weather_extractor, "ensure_token_valid"):
-            with pytest.raises(ValueError, match="weather parameter"):
+            with pytest.raises(ValueError, match="Invalid weather_parameters"):
                 weather_extractor.setup_weather_parameters(
                     weather_parameters=["Temperature.standardmax", "bogus_param"]
                 )
 
     def test_invalid_parameter_string_raises(self, weather_extractor):
         with patch.object(weather_extractor, "ensure_token_valid"):
-            with pytest.raises(ValueError, match="weather parameter"):
+            with pytest.raises(ValueError, match="Invalid weather_parameters"):
                 weather_extractor.setup_weather_parameters(weather_parameters="bogus_param")
 
     # --- historical_years ---
@@ -125,7 +125,7 @@ class TestSetupWeatherParameters:
         assert weather_extractor.weather_params["historical_years"] == [2024, 2023, 2022]
 
     def test_historical_years_string_normalized_to_list(self, weather_extractor):
-        """Comma-separated string normalises to list of ints."""
+        """Comma-separated string normalizes to list of ints."""
         with patch.object(weather_extractor, "ensure_token_valid"):
             weather_extractor.setup_weather_parameters(historical_years="2024,2023,2022")
         assert weather_extractor.weather_params["historical_years"] == [2024, 2023, 2022]
